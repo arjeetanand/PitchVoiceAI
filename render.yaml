@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: airtribexrender
+    name: pitchvoice-ai
     runtime: python
     buildCommand: pip install -r backend/requirements.txt -r frontend/requirements.txt
     startCommand: bash render-start.sh
@@ -9,7 +9,7 @@ services:
       - key: BACKEND_URL
         value: http://127.0.0.1:8000
       - key: FRONTEND_ORIGINS
-        value: https://airtribexrender.onrender.com
+        value: https://pitchvoice-ai.onrender.com
       - key: HUGGINGFACE_API_TOKEN
         sync: false
       - key: SARVAM_API_KEY

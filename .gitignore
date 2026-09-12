@@ -5,3 +5,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.DS_Store
+
+# Local design/reference repositories. They are not part of PitchVoiceAI.
+motion-primitives/
+threeui/

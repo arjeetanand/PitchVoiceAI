@@ -7,14 +7,14 @@ Streamlit interface for the AirtribeXRender pitch voice backend.
 Start the backend first:
 
 ```powershell
-cd AIrtribeXRender\backend
+cd PitchVoiceAI/backend
 python -m uvicorn app:app --reload
 ```
 
 Then start the frontend in a second terminal:
 
 ```powershell
-cd AIrtribeXRender\frontend
+cd PitchVoiceAI/frontend
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
@@ -30,4 +30,4 @@ The frontend lets users:
 - Play grounded answers aloud.
 - Record a question and receive a Hugging Face Whisper transcription, grounded answer, and spoken response.
 
-Configure `HUGGINGFACE_API_TOKEN` in the repository root `.env`. The default models are Whisper for speech-to-text, Qwen for grounded answer generation, and MMS-TTS for speech output. OpenAI remains a fallback when configured. Extractive Q&A works without a provider key.
+Configure `HUGGINGFACE_API_TOKEN` in the repository root `.env` for voice transcription and provider-backed answer generation. `SARVAM_API_KEY` enables the preferred Bulbul TTS path; local Hugging Face TTS, Hugging Face API TTS, and OpenAI TTS are supported fallbacks. Extractive Q&A works without a provider key, while speech controls show a setup message when no speech provider is configured.

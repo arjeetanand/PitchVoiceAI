@@ -10,7 +10,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from routes.pitch import router, store
 
 
-app = FastAPI(title="AirtribeXRender Pitch Voice API", version="1.0.0")
+app = FastAPI(title="PitchVoice AI API", version="1.0.0")
 allowed_origins = [
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")

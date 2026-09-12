@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from html import escape
 from pathlib import Path
@@ -73,10 +74,23 @@ def api_request(method: str, path: str, *, timeout: int = 45, **kwargs: Any) -> 
 
 def response_detail(response: requests.Response) -> str:
     try:
-        detail = response.json().get("detail", response.text)
-    except ValueError:
+        payload = response.json()
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("error") or response.text
+    elif payload is not None:
+        detail = payload
+    else:
         detail = response.text
+    if isinstance(detail, (dict, list)):
+        detail = json.dumps(detail)
     return str(detail or "Request failed.")
+
+
+def response_audio_format(response: requests.Response, fallback: str = "audio/wav") -> str:
+    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    return media_type if media_type.startswith("audio/") else fallback
 
 
 def show_api_error(response: requests.Response) -> None:
@@ -88,14 +102,6 @@ def process_uploaded_file(uploaded_file: Any) -> None:
     uploaded_hash = hashlib.sha256(uploaded_bytes).hexdigest()
     if uploaded_hash == st.session_state.processed_file_hash:
         return
-
-    st.session_state.processed_file_hash = uploaded_hash
-    st.session_state.processed_recording_hash = None
-    st.session_state.pitch = None
-    st.session_state.answer = None
-    st.session_state.pitch_audio = None
-    st.session_state.answer_audio = None
-    st.session_state.pitch_audio_error = None
 
     with st.spinner("Extracting the pitch and preparing the workspace..."):
         try:
@@ -118,16 +124,38 @@ def process_uploaded_file(uploaded_file: Any) -> None:
             if not pitch_response.ok:
                 show_api_error(pitch_response)
                 return
-
-            st.session_state.pitch = pitch_response.json()
-            audio_response = api_request("POST", "/api/pitch/read", timeout=90)
-            if audio_response.ok:
-                st.session_state.pitch_audio = audio_response.content
-            else:
-                st.session_state.pitch_audio_error = response_detail(audio_response)
-            st.rerun()
-        except requests.RequestException as exc:
+            next_pitch = pitch_response.json()
+        except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
             st.error(f"Upload failed: {exc}")
+            st.session_state.processed_file_hash = None
+            return
+
+        next_audio = None
+        next_audio_format = "audio/wav"
+        next_audio_error = None
+        try:
+            audio_response = api_request("POST", "/api/pitch/read", timeout=90)
+            if audio_response.ok and audio_response.content:
+                next_audio = audio_response.content
+                next_audio_format = response_audio_format(audio_response)
+            else:
+                next_audio_error = response_detail(audio_response)
+        except requests.RequestException as exc:
+            next_audio_error = str(exc)
+
+        st.session_state.processed_file_hash = uploaded_hash
+        st.session_state.processed_recording_hash = None
+        st.session_state.pitch = next_pitch
+        st.session_state.answer = None
+        st.session_state.pitch_audio = next_audio
+        st.session_state.pitch_audio_format = next_audio_format
+        st.session_state.answer_audio = None
+        st.session_state.answer_audio_format = None
+        st.session_state.pitch_audio_error = next_audio_error
+        st.session_state.answer_audio_error = None
+        st.session_state.last_heard_question = None
+        st.session_state.clear_typed_question = True
+        st.rerun()
 
 
 def answer_from_question(question: str) -> None:
@@ -141,9 +169,11 @@ def answer_from_question(question: str) -> None:
         if response.ok:
             st.session_state.answer = response.json()
             st.session_state.answer_audio = None
+            st.session_state.answer_audio_format = None
+            st.session_state.answer_audio_error = None
         else:
             show_api_error(response)
-    except requests.RequestException as exc:
+    except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
         st.error(f"Question failed: {exc}")
 
 
@@ -153,8 +183,10 @@ def process_voice_recording(recording: Any) -> None:
     if recording_hash == st.session_state.processed_recording_hash:
         return
 
-    st.session_state.processed_recording_hash = recording_hash
     st.session_state.answer_audio = None
+    st.session_state.answer_audio_format = None
+    st.session_state.answer_audio_error = None
+    st.session_state.last_heard_question = None
     with st.spinner("Transcribing and answering from the pitch..."):
         try:
             transcription_response = api_request(
@@ -187,18 +219,24 @@ def process_voice_recording(recording: Any) -> None:
             st.session_state.answer = answer_response.json()
             st.session_state.last_heard_question = question_text
             if st.session_state.answer["grounded"]:
-                audio_response = api_request(
-                    "POST",
-                    "/api/voice/speak",
-                    json={"text": st.session_state.answer["answer"]},
-                    timeout=90,
-                )
-                if audio_response.ok:
-                    st.session_state.answer_audio = audio_response.content
-                else:
-                    st.session_state.answer_audio_error = response_detail(audio_response)
-        except requests.RequestException as exc:
+                try:
+                    audio_response = api_request(
+                        "POST",
+                        "/api/voice/speak",
+                        json={"text": st.session_state.answer["answer"]},
+                        timeout=90,
+                    )
+                    if audio_response.ok and audio_response.content:
+                        st.session_state.answer_audio = audio_response.content
+                        st.session_state.answer_audio_format = response_audio_format(audio_response)
+                    else:
+                        st.session_state.answer_audio_error = response_detail(audio_response)
+                except requests.RequestException as exc:
+                    st.session_state.answer_audio_error = str(exc)
+            st.session_state.processed_recording_hash = recording_hash
+        except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
             st.error(f"Voice conversation failed: {exc}")
+            st.session_state.processed_recording_hash = None
 
 
 for key, default in {
@@ -208,13 +246,18 @@ for key, default in {
     "processed_file_hash": None,
     "processed_recording_hash": None,
     "pitch_audio": None,
+    "pitch_audio_format": "audio/wav",
     "answer_audio": None,
+    "answer_audio_format": "audio/wav",
     "pitch_audio_error": None,
     "answer_audio_error": None,
     "last_heard_question": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+if st.session_state.pop("clear_typed_question", False):
+    st.session_state.pop("typed_question", None)
 
 
 st.markdown(
@@ -245,8 +288,9 @@ st.markdown(
         color: var(--pr-ink);
     }
     [data-testid="stAppViewContainer"] { background: transparent; }
-    [data-testid="stHeader"] { background: transparent; height: 0; }
-    [data-testid="stToolbar"] { visibility: hidden; }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stToolbar"] { visibility: visible; background: transparent; }
+    [data-testid="stMainMenuButton"] { visibility: hidden; }
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
     [data-testid="stMainBlockContainer"], .block-container {
@@ -631,7 +675,9 @@ st.markdown(
 
     [data-testid="stSidebar"] { border-right: 1px solid var(--pr-line); background: #fbfcff; }
     [data-testid="stSidebar"] * { color: var(--pr-ink); }
-    [data-testid="stSidebar"] .stButton > button { background: #ffffff; color: var(--pr-blue); border-color: #c9d9ff; box-shadow: none; }
+    [data-testid="stSidebar"] .stButton > button { background: #ffffff; color: var(--pr-blue) !important; border-color: #c9d9ff; box-shadow: none; }
+    [data-testid="stSidebar"] .stButton > button p,
+    [data-testid="stSidebar"] .stButton > button span { color: var(--pr-blue) !important; }
     [data-testid="stSidebar"] .stButton > button:hover { background: var(--pr-lavender); border-color: #9fbaff; }
     .pr-sidebar-title { padding: 1rem 0 0.3rem; color: var(--pr-ink); font-size: 1.1rem; font-weight: 800; letter-spacing: -0.04em; }
     .pr-sidebar-copy { color: var(--pr-muted); font-size: 0.77rem; line-height: 1.5; }
@@ -868,7 +914,11 @@ else:
                     f'<div class="pr-audio-card"><div class="pr-audio-card-label">{icon("play", 16)} Read it aloud</div>',
                     unsafe_allow_html=True,
                 )
-                st.audio(st.session_state.pitch_audio, format="audio/wav", autoplay=True)
+                st.audio(
+                    st.session_state.pitch_audio,
+                    format=st.session_state.pitch_audio_format or "audio/wav",
+                    autoplay=True,
+                )
                 st.markdown("</div>", unsafe_allow_html=True)
             elif st.session_state.pitch_audio_error:
                 st.info("Pitch loaded. Add a speech provider in .env to enable read-aloud playback.")
@@ -938,8 +988,6 @@ else:
                     ''',
                     unsafe_allow_html=True,
                 )
-                if st.session_state.answer_audio is not None:
-                    st.audio(st.session_state.answer_audio, format="audio/wav", autoplay=True)
                 if answer["grounded"] and st.button("Play answer", use_container_width=True, key="play_answer"):
                     try:
                         speak_response = api_request(
@@ -948,12 +996,22 @@ else:
                             json={"text": answer["answer"]},
                             timeout=90,
                         )
-                        if speak_response.ok:
-                            st.audio(speak_response.content, format="audio/mpeg", autoplay=False)
+                        if speak_response.ok and speak_response.content:
+                            st.session_state.answer_audio = speak_response.content
+                            st.session_state.answer_audio_format = response_audio_format(speak_response, "audio/mpeg")
+                            st.session_state.answer_audio_error = None
                         else:
-                            show_api_error(speak_response)
-                    except requests.RequestException as exc:
-                        st.error(f"Audio request failed: {exc}")
+                            st.session_state.answer_audio_error = response_detail(speak_response)
+                    except (requests.RequestException, TypeError, ValueError) as exc:
+                        st.session_state.answer_audio_error = str(exc)
+                if st.session_state.answer_audio is not None:
+                    st.audio(
+                        st.session_state.answer_audio,
+                        format=st.session_state.answer_audio_format or "audio/wav",
+                        autoplay=False,
+                    )
+                elif st.session_state.answer_audio_error:
+                    st.info("Answer ready. Add a speech provider in .env to enable audio playback.")
                 with st.expander("View source sections"):
                     for index, source_section in enumerate(answer["sources"], start=1):
                         st.markdown(f"**{index}.** {escape(str(source_section))}")
