@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: airtribexrender
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt -r frontend/requirements.txt
+    startCommand: bash render-start.sh
+    healthCheckPath: /
+    envVars:
+      - key: BACKEND_URL
+        value: http://127.0.0.1:8000
+      - key: FRONTEND_ORIGINS
+        value: https://airtribexrender.onrender.com
+      - key: HUGGINGFACE_API_TOKEN
+        sync: false
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: PITCH_DOCUMENT_PATH
+        value: ./data/pitch.txt
+      - key: HUGGINGFACE_TTS_MODE
+        value: local
