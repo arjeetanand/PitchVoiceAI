@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import io
+import base64
 import os
 import re
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -151,27 +153,84 @@ def _huggingface_audio(text: str) -> bytes:
     return _huggingface_request(model, json.dumps({"inputs": text}).encode(), "application/json")
 
 
+def _sarvam_audio(text: str) -> bytes:
+    api_key = _setting("SARVAM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("SARVAM_API_KEY is not configured")
+    chunks = [text[index:index + 2500] for index in range(0, len(text), 2500)]
+    audio_parts: list[bytes] = []
+    for chunk in chunks:
+        payload = {
+            "text": chunk,
+            "target_language_code": _setting("SARVAM_LANGUAGE_CODE", "en-IN"),
+            "speaker": _setting("SARVAM_SPEAKER", "shubh"),
+            "model": _setting("SARVAM_TTS_MODEL", "bulbul:v3"),
+            "speech_sample_rate": 24000,
+            "output_audio_codec": "wav",
+        }
+        request = urllib.request.Request(
+            "https://api.sarvam.ai/text-to-speech",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                audio_parts.append(base64.b64decode(result["audios"][0]))
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            raise RuntimeError("Sarvam text-to-speech failed. Check SARVAM_API_KEY and voice settings.") from exc
+
+    if len(audio_parts) == 1:
+        return audio_parts[0]
+    output = io.BytesIO()
+    with wave.open(io.BytesIO(audio_parts[0]), "rb") as first:
+        params = first.getparams()
+        frames = [first.readframes(first.getnframes())]
+    for part in audio_parts[1:]:
+        with wave.open(io.BytesIO(part), "rb") as current:
+            frames.append(current.readframes(current.getnframes()))
+    with wave.open(output, "wb") as combined:
+        combined.setparams(params)
+        combined.writeframes(b"".join(frames))
+    return output.getvalue()
+
+
 def _local_huggingface_audio(text: str) -> bytes:
     try:
         import numpy as np
         import torch
         from scipy.io import wavfile
-        from transformers import AutoTokenizer, VitsModel
-    except ImportError as exc:
+        from transformers import AutoProcessor, AutoTokenizer, BarkModel, VitsModel
+    except (ImportError, OSError) as exc:
         raise RuntimeError(
-            "Local Hugging Face TTS dependencies are missing. Install backend requirements.txt."
+            "Local Hugging Face TTS dependencies are unavailable or PyTorch is corrupted. "
+            "Reinstall CPU-only PyTorch, then install backend requirements.txt."
         ) from exc
 
     model_name = _setting("HUGGINGFACE_TTS_MODEL", "facebook/mms-tts-eng")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = VitsModel.from_pretrained(model_name)
-    inputs = tokenizer(text, return_tensors="pt")
-    with torch.no_grad():
-        waveform = model(**inputs).waveform
+    if model_name.lower().startswith("suno/bark"):
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = BarkModel.from_pretrained(model_name)
+        inputs = processor(
+            text,
+            voice_preset=_setting("HUGGINGFACE_TTS_VOICE", "v2/en_speaker_6"),
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            waveform = model.generate(**inputs)
+        sample_rate = model.generation_config.sample_rate
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = VitsModel.from_pretrained(model_name)
+        inputs = tokenizer(text, return_tensors="pt")
+        with torch.no_grad():
+            waveform = model(**inputs).waveform
+        sample_rate = model.config.sampling_rate
     audio = waveform.squeeze().cpu().numpy()
     audio = np.clip(audio, -1, 1)
     buffer = io.BytesIO()
-    wavfile.write(buffer, model.config.sampling_rate, (audio * 32767).astype(np.int16))
+    wavfile.write(buffer, sample_rate, (audio * 32767).astype(np.int16))
     return buffer.getvalue()
 
 
@@ -185,10 +244,12 @@ def _huggingface_transcription(audio: bytes, content_type: str) -> str:
 
 
 def _speech_audio(text: str, voice: str | None = None) -> bytes:
-    if _setting("HUGGINGFACE_API_TOKEN", ""):
-        if _setting("HUGGINGFACE_TTS_MODE", "local") == "api":
-            return _huggingface_audio(text)
+    if _setting("SARVAM_API_KEY", ""):
+        return _sarvam_audio(text)
+    if _setting("HUGGINGFACE_TTS_MODE", "local") == "local":
         return _local_huggingface_audio(text)
+    if _setting("HUGGINGFACE_API_TOKEN", ""):
+        return _huggingface_audio(text)
     if _setting("OPENAI_API_KEY", ""):
         return _openai_audio(text, voice or _setting("OPENAI_TTS_VOICE", "alloy"))
     raise RuntimeError(
@@ -197,7 +258,7 @@ def _speech_audio(text: str, voice: str | None = None) -> bytes:
 
 
 def _speech_media_type() -> str:
-    if _setting("HUGGINGFACE_API_TOKEN", "") and _setting("HUGGINGFACE_TTS_MODE", "local") == "local":
+    if _setting("SARVAM_API_KEY", "") or (_setting("HUGGINGFACE_TTS_MODE", "local") == "local"):
         return "audio/wav"
     return "audio/mpeg"
 
@@ -209,6 +270,7 @@ def health() -> dict[str, Any]:
         "document_loaded": bool(store.text),
         "document_source": store.source,
         "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
+        "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
     }
 
 

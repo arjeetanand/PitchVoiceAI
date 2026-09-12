@@ -271,7 +271,19 @@ else:
 
     with transcript_col:
         st.subheader("Pitch transcript")
-        st.markdown(f"<div class='transcript'>{escape(pitch['text'])}</div>", unsafe_allow_html=True)
+        st.text_area(
+            "Extracted transcript",
+            value=pitch["text"],
+            height=440,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+        st.download_button(
+            "Download transcript",
+            data=pitch["text"],
+            file_name="pitch-transcript.txt",
+            mime="text/plain",
+        )
 
     with ask_col:
         st.subheader("Ask the pitch")
