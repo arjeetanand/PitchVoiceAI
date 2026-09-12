@@ -11,10 +11,10 @@ $env:PITCH_DOCUMENT_PATH = ".\data\pitch.txt"
 python -m uvicorn app:app --reload
 ```
 
-For local MMS TTS, install a CPU PyTorch build in the active environment before installing the requirements:
+For local MMS TTS, the requirements install the CPU-only PyTorch build automatically:
 
 ```bash
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
 ```
 
 The API runs at `http://localhost:8000`. Interactive API documentation is available at `/docs`.
@@ -30,7 +30,7 @@ The API runs at `http://localhost:8000`. Interactive API documentation is availa
 - `POST /api/voice/speak` accepts `{ "text": "...", "voice": "alloy" }` and returns MP3 audio.
 - `POST /api/voice/transcribe` accepts a recorded audio file and returns a Hugging Face Whisper transcription.
 
-Set `HUGGINGFACE_API_TOKEN` to use Hugging Face for speech-to-text and grounded answer generation. Text-to-speech uses the open-source `facebook/mms-tts-eng` model locally by default, so it does not depend on a hosted provider. Set `HUGGINGFACE_TTS_MODE=api` only when using a TTS model deployed by a Hugging Face provider. Without provider keys, question answering uses a local extractive fallback and speech routes return `503`.
+Set `SARVAM_API_KEY` to use Sarvam Bulbul for speech output. Sarvam is preferred for TTS and handles long pitches in chunks. Hugging Face remains responsible for speech-to-text and grounded answer generation, with local Hugging Face TTS as a fallback. Without provider keys, question answering uses a local extractive fallback and speech routes return `503`.
 
 Set `FRONTEND_ORIGINS` to a comma-separated list of browser origins allowed to call the API. The repository root `.env` is loaded automatically when the backend starts. Fill in `HUGGINGFACE_API_TOKEN` there before using voice conversations.
 
