@@ -24,6 +24,15 @@ STOP_WORDS = {
     "a", "an", "and", "are", "does", "how", "in", "is", "it", "of",
     "the", "to", "what", "when", "where", "who", "why",
 }
+# Keep tokens lexical rather than possessive.  Treating "AI's" as one token
+# can make a repeated product name look like evidence for an unsupported fact.
+WORD_PATTERN = re.compile(r"[a-zA-Z0-9]+")
+AUDIO_UPLOAD_EXTENSIONS = {
+    ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
+    ".oga", ".ogg", ".wav", ".webm",
+}
+AUDIO_UPLOAD_VIDEO_TYPES = {"video/mp4", "video/webm"}
+DEFAULT_MAX_AUDIO_BYTES = 10 * 1024 * 1024
 router = APIRouter()
 
 
@@ -41,11 +50,74 @@ def _document_path() -> Path:
     return Path.cwd() / configured
 
 
+def _answer_generation_provider() -> str:
+    """Return an explicitly enabled answer-generation provider, if any.
+
+    The extractive answer is intentionally the default: it is fast, grounded in
+    the uploaded pitch, and does not depend on a remote model during a demo.
+    Set ANSWER_GENERATION_PROVIDER=huggingface to opt into generated answers.
+    """
+    configured = _setting("ANSWER_GENERATION_PROVIDER", "extractive").lower()
+    return "huggingface" if configured in {"huggingface", "hf"} else "extractive"
+
+
+def _audio_upload_limit() -> int:
+    try:
+        configured = int(_setting("MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES)))
+    except ValueError:
+        return DEFAULT_MAX_AUDIO_BYTES
+    return configured if configured > 0 else DEFAULT_MAX_AUDIO_BYTES
+
+
+def _audio_content_type(file: UploadFile) -> str:
+    return (file.content_type or "audio/wav").split(";", 1)[0].strip().lower() or "audio/wav"
+
+
+def _is_supported_audio_upload(file: UploadFile) -> bool:
+    content_type = _audio_content_type(file)
+    extension = Path(file.filename or "").suffix.lower()
+    return (
+        content_type.startswith("audio/")
+        or content_type in AUDIO_UPLOAD_VIDEO_TYPES
+        or extension in AUDIO_UPLOAD_EXTENSIONS
+    )
+
+
+async def _read_limited_audio_upload(file: UploadFile, max_bytes: int) -> bytes:
+    declared_size = getattr(file, "size", None)
+    if isinstance(declared_size, int) and declared_size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio uploads must be at most {max_bytes:,} bytes.",
+        )
+
+    audio = bytearray()
+    while True:
+        # Read one extra byte beyond the remaining allowance so a streamed
+        # upload cannot bypass the limit when its size metadata is absent.
+        chunk_size = min(1024 * 1024, max_bytes - len(audio) + 1)
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        audio.extend(chunk)
+        if len(audio) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio uploads must be at most {max_bytes:,} bytes.",
+            )
+
+    if not audio:
+        raise HTTPException(status_code=400, detail="Upload a non-empty audio recording.")
+    return bytes(audio)
+
+
 class DocumentStore:
     def __init__(self, path: Path = DEFAULT_DOCUMENT) -> None:
         self.path = path
         self.text = ""
-        self.source = str(path)
+        # A source label is user-facing.  Keep it readable for a presenter and
+        # avoid exposing a server filesystem path in the public live room.
+        self.source = path.name or "approved source"
         self.load()
 
     def load(self) -> str:
@@ -86,16 +158,43 @@ store = DocumentStore(_document_path())
 
 
 def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
-    words = {
+    question_words = {
         word.lower()
-        for word in re.findall(r"[a-zA-Z0-9']+", question)
+        for word in WORD_PATTERN.findall(question)
         if len(word) > 2 and word.lower() not in STOP_WORDS
     }
+    if not question_words:
+        return []
+
+    chunk_words = [
+        {word.lower() for word in WORD_PATTERN.findall(chunk) if len(word) > 2}
+        for chunk in chunks
+    ]
+    document_frequency = {
+        word: sum(word in words for words in chunk_words)
+        for word in question_words
+    }
+    common_in_document = max(2, (len(chunks) + 1) // 2)
+    distinctive_words = {
+        word for word in question_words if document_frequency[word] < common_in_document
+    }
+    # A broad question such as "What is Pitchroom?" can legitimately contain
+    # only common subject terms. Keep that case answerable, but never let a
+    # repeated brand name make an unsupported specific claim appear grounded.
+    words = distinctive_words or question_words
     scored = sorted(
-        ((sum(word in chunk.lower() for word in words), index, chunk) for index, chunk in enumerate(chunks)),
+        ((len(words.intersection(chunk_word_set)), index, chunk) for index, (chunk, chunk_word_set) in enumerate(zip(chunks, chunk_words))),
         key=lambda item: (-item[0], item[1]),
     )
-    return [chunk for score, _, chunk in scored[:4] if score > 0]
+    if not scored or scored[0][0] <= 0:
+        return []
+
+    # An extractive answer is read aloud during the demo. Keep the context
+    # focused on the strongest evidence instead of stitching together every
+    # loosely related sentence that shares one generic word.
+    top_score = scored[0][0]
+    minimum_score = max(1, (top_score * 3 + 4) // 5)  # ceiling(top_score * 0.6)
+    return [chunk for score, _, chunk in scored[:4] if score >= minimum_score]
 
 
 def _huggingface_request(model: str, payload: bytes, content_type: str) -> bytes:
@@ -202,7 +301,7 @@ def _sarvam_audio(text: str) -> bytes:
     for chunk in chunks:
         payload = {
             "text": chunk,
-            "target_language_code": _setting("SARVAM_LANGUAGE_CODE", "en-IN"),
+            "language_code": _setting("SARVAM_LANGUAGE_CODE", "en-IN"),
             "speaker": _setting("SARVAM_SPEAKER", "shubh"),
             "model": _setting("SARVAM_TTS_MODEL", "bulbul:v3"),
             "speech_sample_rate": 24000,
@@ -317,25 +416,36 @@ def _huggingface_transcription(audio: bytes, content_type: str) -> str:
 
 
 def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
+    errors: list[str] = []
     if _setting("SARVAM_API_KEY", ""):
-        return _sarvam_audio(text), "audio/wav"
+        try:
+            return _sarvam_audio(text), "audio/wav"
+        except RuntimeError as exc:
+            errors.append(f"Sarvam: {exc}")
+
     mode = _setting("HUGGINGFACE_TTS_MODE", "local").lower()
-    local_error: RuntimeError | None = None
     if mode == "local":
         try:
             return _local_huggingface_audio(text), "audio/wav"
         except RuntimeError as exc:
-            local_error = exc
+            errors.append(f"Local Hugging Face: {exc}")
+
     if _setting("HUGGINGFACE_API_TOKEN", ""):
         try:
             media_type = _setting("HUGGINGFACE_TTS_MEDIA_TYPE", "audio/wav")
             return _huggingface_audio(text), media_type
         except RuntimeError as exc:
-            local_error = exc
+            errors.append(f"Hugging Face API: {exc}")
+
     if _setting("OPENAI_API_KEY", ""):
-        return _openai_audio(text, voice or _setting("OPENAI_TTS_VOICE", "alloy")), "audio/mpeg"
-    if local_error is not None:
-        raise local_error
+        try:
+            return _openai_audio(text, voice or _setting("OPENAI_TTS_VOICE", "alloy")), "audio/mpeg"
+        except RuntimeError as exc:
+            errors.append(f"OpenAI: {exc}")
+
+    if errors:
+        raise RuntimeError("All configured text-to-speech providers failed: " + "; ".join(errors))
+
     raise RuntimeError(
         "No speech provider is configured. Set SARVAM_API_KEY, HUGGINGFACE_API_TOKEN, or OPENAI_API_KEY in .env."
     )
@@ -371,6 +481,22 @@ def get_pitch() -> dict[str, Any]:
     if not store.text:
         raise HTTPException(status_code=404, detail="No pitch document has been loaded.")
     return {"source": store.source, "text": store.text, "chunks": store.chunks()}
+
+
+@router.post("/api/pitch/demo")
+def load_demo_pitch() -> dict[str, Any]:
+    """Restore the included, non-sensitive Pitchroom demo brief.
+
+    This gives a presenter a reliable one-click reset after experimenting with
+    an uploaded source during rehearsal.
+    """
+    try:
+        text = DEFAULT_DOCUMENT.read_text(encoding="utf-8")
+        store.path = DEFAULT_DOCUMENT
+        store.replace(text, DEFAULT_DOCUMENT.name)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="The included demo source could not be loaded.") from exc
+    return {"source": store.source, "characters": len(store.text), "chunks": len(store.chunks())}
 
 
 @router.post("/api/pitch/document")
@@ -409,20 +535,30 @@ def answer_question(request: QuestionRequest) -> dict[str, Any]:
     if not store.text:
         raise HTTPException(status_code=404, detail="No pitch document has been loaded.")
     context = _relevant_chunks(request.question, store.chunks())
-    try:
-        answer, provider = _answer_with_provider(request.question, context) if context else (_fallback_answer(context), "extractive")
-    except RuntimeError:
-        answer = _fallback_answer(context)
-        provider = "extractive"
+    answer = _fallback_answer(context)
+    provider = "extractive"
+    if context and _answer_generation_provider() == "huggingface":
+        try:
+            answer, provider = _answer_with_provider(request.question, context)
+        except RuntimeError:
+            # A configured generation provider is an enhancement, not a reason
+            # to make a source-grounded answer unavailable during a live demo.
+            pass
     return {"question": request.question, "answer": answer, "grounded": bool(context), "provider": provider, "sources": context}
 
 
 @router.post("/api/voice/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)) -> dict[str, str]:
+    if not _is_supported_audio_upload(file):
+        raise HTTPException(
+            status_code=415,
+            detail="Upload an audio recording (WAV, MP3, M4A, OGG, FLAC, AAC, or WebM).",
+        )
+    audio = await _read_limited_audio_upload(file, _audio_upload_limit())
     if not _setting("HUGGINGFACE_API_TOKEN", ""):
         raise HTTPException(status_code=503, detail="Set HUGGINGFACE_API_TOKEN in .env to transcribe audio.")
     try:
-        text = _huggingface_transcription(await file.read(), file.content_type or "audio/wav")
+        text = _huggingface_transcription(audio, _audio_content_type(file))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"text": text, "provider": "huggingface"}

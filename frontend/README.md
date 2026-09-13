@@ -1,33 +1,25 @@
-# Pitchroom Frontend
+# Pitchroom AI live-room frontend
 
-Streamlit interface for the AirtribeXRender pitch voice backend.
+`static/` is a dependency-free browser application served by FastAPI at `/`. It is designed for a hackathon presentation rather than a manual recorder workflow.
 
 ## Run
 
-Start the backend first:
+From the repository root:
 
-```powershell
-cd PitchVoiceAI/backend
-python -m uvicorn app:app --reload
+```bash
+./run-dev.sh
 ```
 
-Then start the frontend in a second terminal:
+Open `http://127.0.0.1:8501`. The interface and API intentionally share one origin, including in production.
 
-```powershell
-cd PitchVoiceAI/frontend
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
+## Live voice behavior
 
-From the repository root, the same two services can be started together with `./run-dev.sh`. The launcher uses the active Python environment for both Uvicorn and Streamlit.
+1. The presenter selects **Start live session** once and grants microphone permission.
+2. Browser VAD uses microphone RMS energy with a small adaptive noise floor.
+3. Speech is confirmed after about 160 ms; a pause of about 850 ms ends the turn.
+4. The browser uploads the recording to `/api/voice/transcribe`, requests a grounded answer, requests speech, and plays it.
+5. During playback, sustained speech interrupts the reply and continues the hot microphone capture as the next question. Otherwise, the same microphone session re-arms automatically when playback ends.
 
-The frontend lets users:
+An explicit **End live session** control stays available. A typed source-question form is the presentation fallback. The live loop needs an HTTPS page outside `localhost`; use Chrome or Edge for the most predictable demo behavior. Headphones are the most reliable setup for interruption because acoustic echo cancellation varies by venue and microphone.
 
-- Upload PDF, Markdown, or plain-text pitch documents.
-- Review the extracted transcript.
-- Play the full pitch using the backend TTS provider.
-- Ask questions and receive answers grounded in extracted source sections.
-- Play grounded answers aloud.
-- Record a question and receive a Hugging Face Whisper transcription, grounded answer, and spoken response.
-
-Configure `HUGGINGFACE_API_TOKEN` in the repository root `.env` for voice transcription and provider-backed answer generation. `SARVAM_API_KEY` enables the preferred Bulbul TTS path; local Hugging Face TTS, Hugging Face API TTS, and OpenAI TTS are supported fallbacks. Extractive Q&A works without a provider key, while speech controls show a setup message when no speech provider is configured.
+The 3D voice orb asset lives at `static/assets/pitchroom-voice-orb.png`. Its visual states are decorative and respect `prefers-reduced-motion`; VAD does not depend on animation.

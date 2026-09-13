@@ -2,12 +2,10 @@ services:
   - type: web
     name: pitchvoice-ai
     runtime: python
-    buildCommand: pip install -r backend/requirements.txt -r frontend/requirements.txt
+    buildCommand: pip install -r backend/requirements.txt
     startCommand: bash render-start.sh
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
-      - key: BACKEND_URL
-        value: http://127.0.0.1:8000
       - key: FRONTEND_ORIGINS
         value: https://pitchvoice-ai.onrender.com
       - key: HUGGINGFACE_API_TOKEN

@@ -10,3 +10,7 @@ __pycache__/
 # Local design/reference repositories. They are not part of PitchVoiceAI.
 motion-primitives/
 threeui/
+
+# Locally generated presentation staging and render previews.
+.codex-finalizer/
+.deck-build/

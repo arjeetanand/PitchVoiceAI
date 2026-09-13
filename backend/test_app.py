@@ -1,4 +1,6 @@
+import base64
 import io
+import json
 import wave
 
 from pathlib import Path
@@ -17,6 +19,14 @@ def setup_function() -> None:
     app.store.path = Path("missing-pitch.txt")
     app.store.text = ""
     app.store.source = "test"
+
+
+def test_root_serves_the_live_pitchroom_interface() -> None:
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Pitchroom AI" in response.text
+    assert "/static/app.js" in response.text
 
 
 def test_document_upload_and_grounded_answer() -> None:
@@ -41,6 +51,76 @@ def test_answer_declines_unknown_question() -> None:
     assert response.status_code == 200
     assert response.json()["grounded"] is False
     assert "could not find" in response.json()["answer"]
+
+
+def test_answer_declines_unknown_fact_when_the_subject_name_repeats() -> None:
+    client.post(
+        "/api/pitch/document",
+        json={
+            "document": (
+                "Pitchroom AI helps founders prepare for investor meetings. "
+                "Pitchroom AI answers questions from an approved source. "
+                "Pitchroom AI speaks grounded answers aloud. "
+                "Pitchroom AI stores the active demo source in memory."
+            )
+        },
+    )
+
+    response = client.post(
+        "/api/voice/answer",
+        json={"question": "What is Pitchroom AI's Series B valuation?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["grounded"] is False
+    assert "could not find" in response.json()["answer"]
+
+
+def test_answer_declines_unknown_fact_with_a_possessive_product_name() -> None:
+    client.post(
+        "/api/pitch/document",
+        json={
+            "document": (
+                "Pitchroom AI helps founders prepare for investor meetings. "
+                "Pitchroom AI's promise is to answer only from the approved source."
+            )
+        },
+    )
+
+    response = client.post(
+        "/api/voice/answer",
+        json={"question": "What is Pitchroom AI's Series B valuation?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["grounded"] is False
+    assert "could not find" in response.json()["answer"]
+
+
+def test_answer_keeps_the_best_source_section_for_a_scripted_demo_question() -> None:
+    client.post(
+        "/api/pitch/document",
+        json={
+            "document": (
+                "Pitchroom AI solves the problem that static pitch decks can leave founders unable to answer unexpected questions. "
+                "Pitchroom AI helps founder-led startup teams prepare for investor meetings, customer conversations, and internal demos. "
+                "Pitchroom AI's promise is to answer only from the approved source."
+            )
+        },
+    )
+
+    response = client.post(
+        "/api/voice/answer",
+        json={"question": "What kind of teams does Pitchroom AI help?"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["grounded"] is True
+    assert body["sources"] == [
+        "Pitchroom AI helps founder-led startup teams prepare for investor meetings, customer conversations, and internal demos."
+    ]
+    assert "static pitch decks" not in body["answer"]
 
 
 def test_pdf_upload_extracts_text() -> None:
@@ -111,6 +191,77 @@ def test_sarvam_speech_response_advertises_wav(monkeypatch) -> None:
     assert response.content.startswith(b"RIFF")
 
 
+def test_sarvam_payload_uses_current_language_code_field(monkeypatch) -> None:
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"audios": [base64.b64encode(_wav_bytes()).decode()]}).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr(pitch_routes.urllib.request, "urlopen", fake_urlopen)
+
+    assert pitch_routes._sarvam_audio("Read this pitch.") == _wav_bytes()
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["language_code"] == "en-IN"
+    assert "target_language_code" not in payload
+
+
+def test_sarvam_failure_falls_back_to_openai(monkeypatch) -> None:
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "api")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_sarvam_audio",
+        lambda text: (_ for _ in ()).throw(RuntimeError("Sarvam rejected the voice")),
+    )
+    monkeypatch.setattr(pitch_routes, "_openai_audio", lambda text, voice: b"ID3-fallback-audio")
+
+    response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert response.content == b"ID3-fallback-audio"
+
+
+def test_speak_aggregates_errors_only_after_all_configured_providers_fail(monkeypatch) -> None:
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "api")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_sarvam_audio",
+        lambda text: (_ for _ in ()).throw(RuntimeError("Sarvam rejected the voice")),
+    )
+    monkeypatch.setattr(
+        pitch_routes,
+        "_openai_audio",
+        lambda text, voice: (_ for _ in ()).throw(RuntimeError("OpenAI is unavailable")),
+    )
+
+    response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "All configured text-to-speech providers failed" in detail
+    assert "Sarvam rejected the voice" in detail
+    assert "OpenAI is unavailable" in detail
+
+
 def test_openai_is_used_when_local_huggingface_tts_is_unavailable(monkeypatch) -> None:
     monkeypatch.delenv("SARVAM_API_KEY", raising=False)
     monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
@@ -130,6 +281,57 @@ def test_openai_is_used_when_local_huggingface_tts_is_unavailable(monkeypatch) -
     assert response.content == b"ID3-test-audio"
 
 
+def test_answer_is_extractive_by_default_even_when_huggingface_is_configured(monkeypatch) -> None:
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "test-token")
+    monkeypatch.delenv("ANSWER_GENERATION_PROVIDER", raising=False)
+    monkeypatch.setattr(
+        pitch_routes,
+        "_answer_with_provider",
+        lambda question, context: (_ for _ in ()).throw(AssertionError("provider should be opt-in")),
+    )
+    client.post(
+        "/api/pitch/document",
+        json={"document": "The product helps founders prepare for investor meetings."},
+    )
+
+    response = client.post("/api/voice/answer", json={"question": "Who does the product help?"})
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "extractive"
+    assert "founders" in response.json()["answer"]
+
+
+def test_demo_route_restores_the_included_brief_after_an_upload() -> None:
+    client.post("/api/pitch/document", json={"document": "An unrelated rehearsal source."})
+
+    response = client.post("/api/pitch/demo")
+
+    assert response.status_code == 200
+    assert response.json()["source"] == "pitch.txt"
+    pitch = client.get("/api/pitch").json()
+    assert "Pitchroom AI solves the problem" in pitch["text"]
+
+
+def test_huggingface_answer_generation_requires_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "test-token")
+    monkeypatch.setenv("ANSWER_GENERATION_PROVIDER", "huggingface")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_answer_with_provider",
+        lambda question, context: ("A generated, grounded answer.", "huggingface"),
+    )
+    client.post(
+        "/api/pitch/document",
+        json={"document": "The product helps founders prepare for investor meetings."},
+    )
+
+    response = client.post("/api/voice/answer", json={"question": "Who does the product help?"})
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "huggingface"
+    assert response.json()["answer"] == "A generated, grounded answer."
+
+
 def test_invalid_huggingface_transcription_response_is_a_service_error(monkeypatch) -> None:
     monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "test-token")
     monkeypatch.setattr(pitch_routes, "_huggingface_request", lambda model, payload, content_type: b"not-json")
@@ -141,6 +343,34 @@ def test_invalid_huggingface_transcription_response_is_a_service_error(monkeypat
 
     assert response.status_code == 503
     assert "invalid transcription" in response.json()["detail"]
+
+
+def test_transcribe_rejects_non_audio_upload_before_provider_call() -> None:
+    response = client.post(
+        "/api/voice/transcribe",
+        files={"file": ("question.txt", b"not an audio recording", "text/plain")},
+    )
+
+    assert response.status_code == 415
+    assert "audio recording" in response.json()["detail"]
+
+
+def test_transcribe_rejects_oversized_audio_upload(monkeypatch) -> None:
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "test-token")
+    monkeypatch.setenv("MAX_AUDIO_BYTES", "4")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_huggingface_transcription",
+        lambda audio, content_type: (_ for _ in ()).throw(AssertionError("oversized audio was sent upstream")),
+    )
+
+    response = client.post(
+        "/api/voice/transcribe",
+        files={"file": ("question.wav", b"RIFF!", "audio/wav")},
+    )
+
+    assert response.status_code == 413
+    assert "at most 4 bytes" in response.json()["detail"]
 
 
 def test_huggingface_text_accepts_object_response(monkeypatch) -> None:

@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta
+      name="description"
+      content="Pitchroom AI is a source-grounded live pitch rehearsal room."
+    />
+    <title>Pitchroom AI · Live pitch rehearsal</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#live-stage">Skip to live practice</a>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="Pitchroom AI home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 28 28" fill="none">
+              <path d="M6 15.25v2.5M10 10.5v7M14 6.5v15M18 10.5v7M22 15.25v2.5" stroke="currentColor" stroke-linecap="round" stroke-width="2.25" />
+            </svg>
+          </span>
+          <span>Pitchroom <b>AI</b></span>
+        </a>
+
+        <div class="source-indicator" aria-label="Current approved source">
+          <span class="source-dot" aria-hidden="true"></span>
+          <span class="source-indicator-label">Approved source</span>
+          <span id="source-name-top" class="source-name-top">Loading…</span>
+        </div>
+
+        <div class="topbar-actions">
+          <button id="demo-reset" class="button button-quiet" type="button">Reset demo</button>
+          <button id="live-toggle" class="button button-primary" type="button" aria-describedby="live-hint">
+            <svg class="button-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <rect x="9" y="3" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.9" />
+              <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v4m-3 0h6" stroke="currentColor" stroke-linecap="round" stroke-width="1.9" />
+            </svg>
+            <span id="live-toggle-label">Start live session</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="intro" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Live pitch rehearsal</p>
+          <h1 id="page-title">Ask it the way they will.</h1>
+        </div>
+        <p class="intro-copy">Speak naturally, pause when you are done, and Pitchroom finds the approved evidence before it answers. Then it listens again.</p>
+      </section>
+
+      <section id="live-stage" class="live-layout" aria-label="Live practice workspace">
+        <article id="stage-card" class="stage-card is-ready">
+          <div class="stage-header">
+            <div>
+              <p class="eyebrow">Voice room</p>
+              <h2>Live conversation</h2>
+            </div>
+            <div id="state-chip" class="state-chip" aria-live="polite">
+              <span class="state-dot" aria-hidden="true"></span>
+              <span id="state-label">Ready when you are</span>
+            </div>
+          </div>
+
+          <div class="orb-zone" aria-hidden="true">
+            <div class="orb-ring orb-ring-outer"></div>
+            <div class="orb-ring orb-ring-inner"></div>
+            <div class="orb-shadow"></div>
+            <img class="voice-orb" src="/static/assets/pitchroom-voice-orb.png" alt="" />
+            <div class="voice-meter">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+
+          <div class="stage-message">
+            <p id="stage-message-title" class="stage-message-title">One tap starts the room.</p>
+            <p id="stage-message-copy">Pitchroom automatically closes each turn after a brief pause, answers from the source, and re-arms the microphone.</p>
+          </div>
+
+          <div class="stage-controls">
+            <button id="live-toggle-stage" class="button button-primary button-large" type="button">
+              <svg class="button-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="9" y="3" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.9" />
+                <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v4m-3 0h6" stroke="currentColor" stroke-linecap="round" stroke-width="1.9" />
+              </svg>
+              <span id="live-toggle-stage-label">Start live session</span>
+            </button>
+            <p id="live-hint" class="control-hint">Your browser will ask once for microphone permission.</p>
+          </div>
+
+          <p id="voice-error" class="voice-error" role="alert" hidden></p>
+          <p id="live-announcement" class="sr-only" role="status" aria-live="polite"></p>
+        </article>
+
+        <aside class="conversation-card" aria-labelledby="conversation-title">
+          <div class="conversation-header">
+            <div>
+              <p class="eyebrow">Grounded response</p>
+              <h2 id="conversation-title">Conversation</h2>
+            </div>
+            <span id="grounding-badge" class="grounding-badge">Waiting for a question</span>
+          </div>
+
+          <ol class="conversation-flow" aria-label="Question-answer progress">
+            <li id="flow-heard" class="flow-step is-current"><span class="flow-marker">1</span><span>Heard</span></li>
+            <li id="flow-source" class="flow-step"><span class="flow-marker">2</span><span>Find source</span></li>
+            <li id="flow-answer" class="flow-step"><span class="flow-marker">3</span><span>Answer</span></li>
+          </ol>
+
+          <div class="turn-stack">
+            <section class="turn turn-heard" aria-labelledby="heard-title">
+              <div class="turn-label"><span class="turn-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.8"/><path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v4m-3 0h6" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>
+              </span><span id="heard-title">Heard</span></div>
+              <p id="heard-question" class="turn-copy placeholder">Your question will appear here.</p>
+            </section>
+
+            <section class="turn turn-answer" aria-labelledby="answer-title">
+              <div class="turn-label"><span class="turn-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M5 5.75h14a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-7.1l-4.9 3.1v-3.1H5a2 2 0 0 1-2-2v-7.5a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-linejoin="round" stroke-width="1.8"/><path d="M8.5 11.5h7" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>
+              </span><span id="answer-title">Answer</span></div>
+              <p id="answer-copy" class="turn-copy placeholder">Pitchroom will answer only when it finds matching approved-source evidence.</p>
+              <button id="play-answer" class="text-button" type="button" hidden>
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 8 6-8 6z" fill="currentColor"/><path d="M5.5 9.5v5" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>
+                Play answer
+              </button>
+            </section>
+          </div>
+
+          <form id="text-question-form" class="text-question-form">
+            <label for="text-question">No microphone? Ask from the same source.</label>
+            <div class="question-input-row">
+              <input id="text-question" name="question" type="text" maxlength="2000" placeholder="What problem does Pitchroom AI solve?" autocomplete="off" />
+              <button class="button button-secondary" type="submit">Ask</button>
+            </div>
+          </form>
+        </aside>
+      </section>
+
+      <section class="evidence-card" aria-labelledby="evidence-title">
+        <div class="evidence-header">
+          <div>
+            <p class="eyebrow">Audit trail</p>
+            <h2 id="evidence-title">Source evidence</h2>
+          </div>
+          <p id="evidence-status" class="evidence-status">Load a question to see the exact source section used.</p>
+        </div>
+        <div id="evidence-list" class="evidence-list">
+          <p class="empty-evidence">No answer yet. Pitchroom will show the source sentences behind each grounded response.</p>
+        </div>
+      </section>
+
+      <section class="source-card" aria-labelledby="source-title">
+        <div class="source-card-header">
+          <div>
+            <p class="eyebrow">Practice material</p>
+            <h2 id="source-title">Approved source</h2>
+            <p id="source-meta" class="source-meta">Loading the included demo brief…</p>
+          </div>
+          <div class="source-actions">
+            <label class="button button-secondary upload-button" for="source-upload">
+              <svg class="button-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 15.75v-11m0 0-4 4m4-4 4 4M5 14.5v4A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-4" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></svg>
+              Upload pitch
+            </label>
+            <input id="source-upload" type="file" accept=".pdf,.txt,.md,.markdown,application/pdf,text/plain,text/markdown" hidden />
+            <button id="demo-reset-source" class="button button-quiet" type="button">Use demo brief</button>
+          </div>
+        </div>
+        <div id="source-excerpt" class="source-excerpt" tabindex="0" aria-label="Loaded source text"></div>
+        <p class="source-note">Voice turns send recorded audio and reply text only to the speech providers configured by the presenter. Use an approved, non-sensitive practice brief.</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Pitchroom AI</span>
+      <span>Source-grounded rehearsal for the live room.</span>
+    </footer>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,703 @@
+/* Pitchroom AI's live room runs entirely in the browser after one explicit
+ * microphone permission.  The recording is started while the room is armed;
+ * adaptive RMS VAD decides when a speaker has finished a turn. */
+
+const END_OF_TURN_MS = 850;
+const SPEECH_CONFIRMATION_MS = 160;
+const BARGE_IN_CONFIRMATION_MS = 280;
+const BARGE_IN_GRACE_MS = 360;
+const BARGE_IN_MIN_THRESHOLD = 0.018;
+const BARGE_IN_THRESHOLD_MULTIPLIER = 1.45;
+const MAX_TURN_MS = 25000;
+const CALIBRATION_MS = 850;
+const MIN_VOICE_THRESHOLD = 0.012;
+const MAX_VOICE_THRESHOLD = 0.06;
+
+const elements = {
+  stage: document.querySelector("#stage-card"),
+  stateLabel: document.querySelector("#state-label"),
+  stageTitle: document.querySelector("#stage-message-title"),
+  stageCopy: document.querySelector("#stage-message-copy"),
+  topToggle: document.querySelector("#live-toggle"),
+  topToggleLabel: document.querySelector("#live-toggle-label"),
+  stageToggle: document.querySelector("#live-toggle-stage"),
+  stageToggleLabel: document.querySelector("#live-toggle-stage-label"),
+  liveHint: document.querySelector("#live-hint"),
+  liveAnnouncement: document.querySelector("#live-announcement"),
+  voiceError: document.querySelector("#voice-error"),
+  heard: document.querySelector("#heard-question"),
+  answer: document.querySelector("#answer-copy"),
+  groundingBadge: document.querySelector("#grounding-badge"),
+  evidenceStatus: document.querySelector("#evidence-status"),
+  evidenceList: document.querySelector("#evidence-list"),
+  sourceNameTop: document.querySelector("#source-name-top"),
+  sourceMeta: document.querySelector("#source-meta"),
+  sourceExcerpt: document.querySelector("#source-excerpt"),
+  sourceUpload: document.querySelector("#source-upload"),
+  demoReset: document.querySelector("#demo-reset"),
+  demoResetSource: document.querySelector("#demo-reset-source"),
+  textQuestionForm: document.querySelector("#text-question-form"),
+  textQuestion: document.querySelector("#text-question"),
+  playAnswer: document.querySelector("#play-answer"),
+  flowHeard: document.querySelector("#flow-heard"),
+  flowSource: document.querySelector("#flow-source"),
+  flowAnswer: document.querySelector("#flow-answer"),
+  meterBars: [...document.querySelectorAll(".voice-meter span")],
+};
+
+const state = {
+  active: false,
+  phase: "ready",
+  sessionId: 0,
+  stream: null,
+  audioContext: null,
+  analyser: null,
+  analyserData: null,
+  meterFrame: null,
+  recorder: null,
+  recorderContext: null,
+  captureId: 0,
+  recorderStartedAt: 0,
+  turnStartedAt: 0,
+  speechCandidateAt: 0,
+  silenceStartedAt: 0,
+  hasSpoken: false,
+  calibrationUntil: 0,
+  noiseFloor: 0.003,
+  voiceThreshold: MIN_VOICE_THRESHOLD,
+  currentAudio: null,
+  currentAudioUrl: null,
+  playbackId: 0,
+  speakingStartedAt: 0,
+  bargeCandidateAt: 0,
+  turnEpoch: 0,
+  lastAnswer: "",
+  pendingAbort: null,
+};
+
+const phaseCopy = {
+  ready: {
+    label: "Ready when you are",
+    title: "One tap starts the room.",
+    copy: "Pitchroom automatically closes each turn after a brief pause, answers from the source, and re-arms the microphone.",
+    hint: "Your browser will ask once for microphone permission.",
+  },
+  arming: {
+    label: "Opening microphone",
+    title: "Getting the room ready.",
+    copy: "Allow microphone access in your browser to begin the live practice session.",
+    hint: "This only happens once per session.",
+  },
+  listening: {
+    label: "Listening",
+    title: "Speak naturally. Pause when you are finished.",
+    copy: "Pitchroom detects the end of your question after a short pause—there is no stop button for each turn.",
+    hint: "Live microphone · end session at any time",
+  },
+  thinking: {
+    label: "Finding source evidence",
+    title: "Checking the approved source.",
+    copy: "Pitchroom is transcribing your question, then finding the strongest supporting sentences before it responds.",
+    hint: "Your next turn will re-arm automatically.",
+  },
+  speaking: {
+    label: "Answering aloud",
+    title: "Pitchroom is answering.",
+    copy: "Speak over the reply to interrupt it. Pitchroom will stop and listen to your new question.",
+    hint: "Listening resumes after the reply or your interruption.",
+  },
+  error: {
+    label: "Needs attention",
+    title: "The live room needs a quick reset.",
+    copy: "You can keep using typed questions, or start a new live session after checking microphone and voice-provider setup.",
+    hint: "Typed source questions remain available below.",
+  },
+};
+
+function setPhase(phase, announcement = "") {
+  state.phase = phase;
+  elements.stage.className = `stage-card is-${phase}`;
+  const copy = phaseCopy[phase] || phaseCopy.ready;
+  elements.stateLabel.textContent = copy.label;
+  elements.stageTitle.textContent = copy.title;
+  elements.stageCopy.textContent = copy.copy;
+  elements.liveHint.textContent = copy.hint;
+  const isActive = state.active;
+  const buttonText = isActive ? "End live session" : "Start live session";
+  elements.topToggleLabel.textContent = buttonText;
+  elements.stageToggleLabel.textContent = buttonText;
+  elements.topToggle.setAttribute("aria-pressed", String(isActive));
+  elements.stageToggle.setAttribute("aria-pressed", String(isActive));
+  if (announcement) elements.liveAnnouncement.textContent = announcement;
+  updateFlow();
+}
+
+function updateFlow() {
+  const current = state.phase === "thinking" ? 2 : state.phase === "speaking" ? 3 : state.lastAnswer ? 3 : 1;
+  const steps = [elements.flowHeard, elements.flowSource, elements.flowAnswer];
+  steps.forEach((step, index) => {
+    step.classList.toggle("is-current", index + 1 === current);
+    step.classList.toggle("is-complete", index + 1 < current || (index + 1 === 3 && Boolean(state.lastAnswer)));
+  });
+}
+
+function showError(message, keepSession = false) {
+  elements.voiceError.textContent = message;
+  elements.voiceError.hidden = false;
+  if (!keepSession) setPhase("error", message);
+}
+
+function clearError() {
+  elements.voiceError.hidden = true;
+  elements.voiceError.textContent = "";
+}
+
+function responseDetail(payload, fallback) {
+  if (payload && typeof payload === "object" && payload.detail) return String(payload.detail);
+  return fallback;
+}
+
+async function getJson(path, options = {}) {
+  const response = await fetch(path, { headers: { Accept: "application/json", ...(options.headers || {}) }, ...options });
+  let body = null;
+  try { body = await response.json(); } catch (_) { /* keep the HTTP error readable below */ }
+  if (!response.ok) throw new Error(responseDetail(body, `Request failed (${response.status}).`));
+  return body;
+}
+
+function setAnswerPlaceholder() {
+  state.lastAnswer = "";
+  elements.answer.textContent = "Pitchroom will answer only when it finds matching approved-source evidence.";
+  elements.answer.classList.add("placeholder");
+  elements.groundingBadge.textContent = "Waiting for a question";
+  elements.groundingBadge.className = "grounding-badge";
+  elements.playAnswer.hidden = true;
+  elements.evidenceStatus.textContent = "Load a question to see the exact source section used.";
+  elements.evidenceList.innerHTML = '<p class="empty-evidence">No answer yet. Pitchroom will show the source sentences behind each grounded response.</p>';
+  updateFlow();
+}
+
+function setHeard(question) {
+  elements.heard.textContent = question;
+  elements.heard.classList.remove("placeholder");
+}
+
+function renderAnswer(answerData) {
+  state.lastAnswer = answerData.answer || "";
+  elements.answer.textContent = state.lastAnswer || "I could not find that in the pitch document.";
+  elements.answer.classList.remove("placeholder");
+  const grounded = Boolean(answerData.grounded);
+  elements.groundingBadge.textContent = grounded ? "Grounded in source" : "No matching source";
+  elements.groundingBadge.className = `grounding-badge ${grounded ? "is-grounded" : "is-ungrounded"}`;
+  const sources = Array.isArray(answerData.sources) ? answerData.sources : [];
+  if (sources.length) {
+    elements.evidenceStatus.textContent = `${sources.length} source section${sources.length === 1 ? "" : "s"} used for this response.`;
+    elements.evidenceList.innerHTML = "";
+    sources.forEach((source) => {
+      const quote = document.createElement("blockquote");
+      quote.className = "evidence-quote";
+      quote.textContent = source;
+      elements.evidenceList.append(quote);
+    });
+  } else {
+    elements.evidenceStatus.textContent = "No matching approved-source evidence was found, so Pitchroom declined to invent an answer.";
+    elements.evidenceList.innerHTML = '<p class="empty-evidence">No source section matched this question. That refusal is intentional: the answer stays inside the approved brief.</p>';
+  }
+  elements.playAnswer.hidden = !state.lastAnswer;
+  updateFlow();
+}
+
+function sourceDisplayName(source) {
+  const parts = String(source || "Approved source").split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) || "Approved source";
+}
+
+async function loadPitch() {
+  const pitch = await getJson("/api/pitch");
+  const source = sourceDisplayName(pitch.source);
+  elements.sourceNameTop.textContent = source;
+  elements.sourceNameTop.title = source;
+  const chunks = Array.isArray(pitch.chunks) ? pitch.chunks.length : 0;
+  const characters = (pitch.text || "").length;
+  elements.sourceMeta.textContent = `${source} · ${chunks} source sections · ${characters.toLocaleString()} characters`;
+  elements.sourceExcerpt.textContent = pitch.text || "No approved source is loaded.";
+  return pitch;
+}
+
+async function resetDemo() {
+  clearError();
+  if (state.active) stopLiveSession();
+  elements.demoReset.disabled = true;
+  elements.demoResetSource.disabled = true;
+  try {
+    await getJson("/api/pitch/demo", { method: "POST" });
+    await loadPitch();
+    setAnswerPlaceholder();
+    elements.heard.textContent = "Your question will appear here.";
+    elements.heard.classList.add("placeholder");
+    elements.liveAnnouncement.textContent = "The included demo source has been restored.";
+  } catch (error) {
+    showError(`Could not restore the demo source: ${error.message}`);
+  } finally {
+    elements.demoReset.disabled = false;
+    elements.demoResetSource.disabled = false;
+  }
+}
+
+async function uploadPitch(file) {
+  if (!file) return;
+  clearError();
+  if (state.active) stopLiveSession();
+  try {
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    await getJson("/api/pitch/file", { method: "POST", body: formData });
+    await loadPitch();
+    setAnswerPlaceholder();
+    elements.heard.textContent = "Your question will appear here.";
+    elements.heard.classList.add("placeholder");
+    elements.liveAnnouncement.textContent = `${file.name} is now the approved source.`;
+  } catch (error) {
+    showError(`Could not load this pitch: ${error.message}`);
+  } finally {
+    elements.sourceUpload.value = "";
+  }
+}
+
+function clearAudio() {
+  // Invalidate callbacks before touching the element. Removing an audio source
+  // may still dispatch a late error event in some browsers.
+  state.playbackId += 1;
+  const audio = state.currentAudio;
+  const audioUrl = state.currentAudioUrl;
+  state.currentAudio = null;
+  state.currentAudioUrl = null;
+  state.speakingStartedAt = 0;
+  state.bargeCandidateAt = 0;
+  if (audio) {
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+  }
+  if (audioUrl) {
+    URL.revokeObjectURL(audioUrl);
+  }
+}
+
+function selectRecordingOptions() {
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  const supported = types.find((type) => window.MediaRecorder && MediaRecorder.isTypeSupported(type));
+  return supported ? { mimeType: supported } : {};
+}
+
+function startRecorder(mode = "live") {
+  if (!state.active || !state.stream || !window.MediaRecorder) return false;
+  if (state.recorder && state.recorder.state !== "inactive") return false;
+  if (mode !== "barge") {
+    state.hasSpoken = false;
+    state.turnStartedAt = 0;
+    state.speechCandidateAt = 0;
+    state.silenceStartedAt = 0;
+  }
+  state.recorderStartedAt = performance.now();
+  const recorder = new MediaRecorder(state.stream, selectRecordingOptions());
+  const capture = {
+    id: ++state.captureId,
+    mode,
+    accepted: mode !== "barge",
+    chunks: [],
+    recorder,
+    sessionId: state.sessionId,
+    turnEpoch: 0,
+  };
+  state.recorder = recorder;
+  state.recorderContext = capture;
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data && event.data.size) capture.chunks.push(event.data);
+  });
+  recorder.addEventListener("stop", () => {
+    const blob = new Blob(capture.chunks, { type: recorder.mimeType || "audio/webm" });
+    if (state.recorder === recorder) state.recorder = null;
+    if (state.recorderContext === capture) state.recorderContext = null;
+    if (
+      capture.accepted
+      && state.active
+      && capture.sessionId === state.sessionId
+      && state.phase === "thinking"
+      && state.hasSpoken
+      && blob.size > 400
+    ) {
+      const turnEpoch = capture.turnEpoch || ++state.turnEpoch;
+      capture.turnEpoch = turnEpoch;
+      processVoiceTurn(blob, capture.sessionId, turnEpoch);
+    }
+  });
+  recorder.start(120);
+  return true;
+}
+
+function finishDetectedTurn(reason) {
+  if (!state.recorder || state.recorder.state === "inactive" || !state.recorderContext?.accepted || !state.hasSpoken) return;
+  setPhase("thinking", reason === "limit" ? "Maximum live-turn length reached. Finding source evidence now." : "Pause detected. Finding source evidence now.");
+  state.recorder.stop();
+}
+
+function discardBargeCapture() {
+  state.bargeCandidateAt = 0;
+  const capture = state.recorderContext;
+  if (!capture || capture.mode !== "barge" || capture.accepted) return;
+  capture.accepted = false;
+  if (capture.recorder.state !== "inactive") capture.recorder.stop();
+}
+
+async function pauseCaptureForPlayback() {
+  const capture = state.recorderContext;
+  if (!capture || capture.recorder.state === "inactive") return;
+  capture.accepted = false;
+  state.hasSpoken = false;
+  await new Promise((resolve) => {
+    capture.recorder.addEventListener("stop", resolve, { once: true });
+    capture.recorder.stop();
+  });
+}
+
+function confirmBargeIn() {
+  const capture = state.recorderContext;
+  const startedAt = state.bargeCandidateAt;
+  if (!capture || capture.mode !== "barge" || !startedAt) return;
+  capture.accepted = true;
+  capture.turnEpoch = ++state.turnEpoch;
+  clearAudio();
+  state.hasSpoken = true;
+  state.turnStartedAt = startedAt;
+  state.silenceStartedAt = 0;
+  setPhase("listening", "Reply interrupted. Pitchroom is listening to your new question.");
+  elements.stageTitle.textContent = "I heard you — keep speaking.";
+  elements.stageCopy.textContent = "The reply has stopped. Pause when your new question is complete and Pitchroom will send it automatically.";
+}
+
+function detectBargeIn(rms, now) {
+  if (!state.currentAudio || now - state.speakingStartedAt < BARGE_IN_GRACE_MS) return;
+  const threshold = Math.max(BARGE_IN_MIN_THRESHOLD, state.voiceThreshold * BARGE_IN_THRESHOLD_MULTIPLIER);
+  if (rms <= threshold) {
+    if (state.bargeCandidateAt) discardBargeCapture();
+    return;
+  }
+  if (!state.bargeCandidateAt) {
+    if (startRecorder("barge")) state.bargeCandidateAt = now;
+    return;
+  }
+  if (now - state.bargeCandidateAt >= BARGE_IN_CONFIRMATION_MS) confirmBargeIn();
+}
+
+function updateMeter(level) {
+  const scale = Math.max(0.32, Math.min(1.75, 0.3 + level * 24));
+  elements.meterBars.forEach((bar, index) => {
+    const variance = [0.64, 1.05, 1.38, 0.88, 1.52, 1.08, 0.74, 1.22, 0.62][index];
+    bar.style.setProperty("--meter-scale", String(Math.max(0.28, Math.min(1.8, scale * variance))));
+  });
+}
+
+function analyseMicrophone() {
+  if (!state.active || !state.analyser || !state.analyserData) return;
+  state.analyser.getByteTimeDomainData(state.analyserData);
+  let sum = 0;
+  for (const sample of state.analyserData) {
+    const normalized = (sample - 128) / 128;
+    sum += normalized * normalized;
+  }
+  const rms = Math.sqrt(sum / state.analyserData.length);
+  updateMeter(rms);
+  const now = performance.now();
+
+  if (state.phase === "speaking") {
+    detectBargeIn(rms, now);
+  } else if (state.phase === "listening") {
+    if (now < state.calibrationUntil) {
+      state.noiseFloor = state.noiseFloor * 0.93 + rms * 0.07;
+    } else if (rms < state.voiceThreshold * 0.55) {
+      state.noiseFloor = state.noiseFloor * 0.985 + rms * 0.015;
+    }
+    state.voiceThreshold = Math.max(MIN_VOICE_THRESHOLD, Math.min(MAX_VOICE_THRESHOLD, state.noiseFloor * 3.1 + 0.006));
+    const voiced = rms > state.voiceThreshold;
+
+    if (!state.hasSpoken) {
+      if (voiced) {
+        if (!state.speechCandidateAt) state.speechCandidateAt = now;
+        if (now - state.speechCandidateAt >= SPEECH_CONFIRMATION_MS) {
+          state.hasSpoken = true;
+          state.turnStartedAt = now;
+          state.silenceStartedAt = 0;
+          elements.stageTitle.textContent = "Listening to your question…";
+          elements.stageCopy.textContent = "Keep speaking naturally. A brief pause will send this turn automatically.";
+          elements.liveAnnouncement.textContent = "Speech detected. Pitchroom is listening to your question.";
+        }
+      } else {
+        state.speechCandidateAt = 0;
+        if (now - state.recorderStartedAt > MAX_TURN_MS) {
+          const recorder = state.recorder;
+          if (recorder && recorder.state !== "inactive") recorder.stop();
+          window.setTimeout(() => { if (state.active && state.phase === "listening") startRecorder(); }, 40);
+        }
+      }
+    } else if (voiced) {
+      state.silenceStartedAt = 0;
+    } else {
+      if (!state.silenceStartedAt) state.silenceStartedAt = now;
+      if (now - state.silenceStartedAt >= END_OF_TURN_MS) finishDetectedTurn("silence");
+      if (state.turnStartedAt && now - state.turnStartedAt >= MAX_TURN_MS) finishDetectedTurn("limit");
+    }
+  }
+  state.meterFrame = requestAnimationFrame(analyseMicrophone);
+}
+
+function armNextTurn(announcement = "Pitchroom is listening again.", retainNotice = false) {
+  if (!state.active || !state.stream) return;
+  if (!retainNotice) clearError();
+  discardBargeCapture();
+  state.calibrationUntil = performance.now() + Math.min(420, CALIBRATION_MS);
+  setPhase("listening", announcement);
+  if (!startRecorder()) {
+    window.setTimeout(() => {
+      if (state.active && state.phase === "listening" && !state.recorder) startRecorder();
+    }, 80);
+  }
+}
+
+async function startLiveSession() {
+  if (state.active) {
+    stopLiveSession();
+    return;
+  }
+  clearError();
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder || !(window.AudioContext || window.webkitAudioContext)) {
+    showError("This browser does not support live microphone capture. Use the typed source question instead.");
+    return;
+  }
+  setPhase("arming", "Requesting microphone permission.");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    state.active = true;
+    state.sessionId += 1;
+    state.stream = stream;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    state.audioContext = new AudioContextClass();
+    await state.audioContext.resume();
+    const source = state.audioContext.createMediaStreamSource(stream);
+    const analyser = state.audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.78;
+    source.connect(analyser);
+    state.analyser = analyser;
+    state.analyserData = new Uint8Array(analyser.fftSize);
+    state.noiseFloor = 0.003;
+    state.voiceThreshold = MIN_VOICE_THRESHOLD;
+    state.calibrationUntil = performance.now() + CALIBRATION_MS;
+    armNextTurn("Microphone connected. Pitchroom is listening.");
+    state.meterFrame = requestAnimationFrame(analyseMicrophone);
+  } catch (error) {
+    const denied = error && (error.name === "NotAllowedError" || error.name === "SecurityError");
+    showError(denied ? "Microphone access was not allowed. Allow it in browser settings, then start the session again." : `Could not start the microphone: ${error.message || "Unknown error."}`);
+  }
+}
+
+function stopLiveSession() {
+  state.sessionId += 1;
+  state.turnEpoch += 1;
+  state.active = false;
+  if (state.pendingAbort) {
+    state.pendingAbort.abort();
+    state.pendingAbort = null;
+  }
+  if (state.meterFrame) cancelAnimationFrame(state.meterFrame);
+  state.meterFrame = null;
+  if (state.recorder && state.recorder.state !== "inactive") {
+    if (state.recorderContext) state.recorderContext.accepted = false;
+    state.recorder.stop();
+  }
+  state.recorder = null;
+  state.recorderContext = null;
+  clearAudio();
+  if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
+  state.stream = null;
+  if (state.audioContext) state.audioContext.close().catch(() => {});
+  state.audioContext = null;
+  state.analyser = null;
+  state.analyserData = null;
+  updateMeter(0);
+  setPhase("ready", "The live session has ended.");
+}
+
+async function requestAnswer(question, signal) {
+  return getJson("/api/voice/answer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+    signal,
+  });
+}
+
+async function requestSpeech(text, signal) {
+  const response = await fetch("/api/voice/speak", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+    signal,
+  });
+  if (!response.ok) {
+    let body = null;
+    try { body = await response.json(); } catch (_) { /* preserve fallback below */ }
+    throw new Error(responseDetail(body, `Speech request failed (${response.status}).`));
+  }
+  return response.blob();
+}
+
+async function playBlob(blob, resumeWhenFinished) {
+  clearAudio();
+  const audioUrl = URL.createObjectURL(blob);
+  const audio = new Audio(audioUrl);
+  const playbackId = state.playbackId;
+  state.currentAudio = audio;
+  state.currentAudioUrl = audioUrl;
+  audio.addEventListener("ended", () => {
+    if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
+    discardBargeCapture();
+    clearAudio();
+    if (resumeWhenFinished || state.active) armNextTurn("Answer complete. Pitchroom is listening again.");
+    else setPhase("ready", "Answer playback complete.");
+  }, { once: true });
+  audio.addEventListener("error", () => {
+    if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
+    discardBargeCapture();
+    clearAudio();
+    if (resumeWhenFinished || state.active) armNextTurn("Audio playback was interrupted. Pitchroom is listening again.");
+  }, { once: true });
+  state.speakingStartedAt = performance.now();
+  setPhase("speaking", "Pitchroom is answering aloud.");
+  try {
+    await audio.play();
+    if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
+    if (state.active && resumeWhenFinished) startRecorder("barge");
+  } catch (error) {
+    if (playbackId !== state.playbackId) return;
+    elements.playAnswer.hidden = false;
+    discardBargeCapture();
+    if (resumeWhenFinished) armNextTurn("The answer is ready. This browser needs one tap to play it; Pitchroom is listening again.");
+    else setPhase(state.active ? "listening" : "ready", "Answer audio is ready to play.");
+  }
+}
+
+async function processVoiceTurn(blob, sessionId, turnEpoch) {
+  const controller = new AbortController();
+  state.pendingAbort = controller;
+  try {
+    const fileType = blob.type || "audio/webm";
+    const extension = fileType.includes("mp4") ? "mp4" : "webm";
+    const audio = new File([blob], `pitchroom-question.${extension}`, { type: fileType });
+    const formData = new FormData();
+    formData.append("file", audio, audio.name);
+    const transcription = await getJson("/api/voice/transcribe", { method: "POST", body: formData, signal: controller.signal });
+    if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+    const question = String(transcription.text || "").trim();
+    if (!question) throw new Error("No speech was detected. Try asking your question again.");
+    setHeard(question);
+    const answerData = await requestAnswer(question, controller.signal);
+    if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+    renderAnswer(answerData);
+    try {
+      const speechBlob = await requestSpeech(answerData.answer, controller.signal);
+      if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+      await playBlob(speechBlob, true);
+    } catch (speechError) {
+      if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+      showError(`The grounded answer is ready, but voice playback is unavailable: ${speechError.message}`, true);
+      armNextTurn("The answer is on screen. Voice playback is unavailable, and Pitchroom is listening again.", true);
+    }
+  } catch (error) {
+    if (error.name === "AbortError" || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+    showError(`Live voice turn could not finish: ${error.message}`, true);
+    if (state.active) armNextTurn("That turn could not be completed. Pitchroom is listening again.", true);
+  } finally {
+    if (state.pendingAbort === controller) state.pendingAbort = null;
+  }
+}
+
+async function askTypedQuestion(event) {
+  event.preventDefault();
+  const question = elements.textQuestion.value.trim();
+  if (question.length < 2) {
+    elements.textQuestion.focus();
+    return;
+  }
+  clearError();
+  const wasActive = state.active;
+  if (state.recorder && state.recorder.state !== "inactive") {
+    // Do not let a partly spoken live turn race the intentional typed question.
+    state.hasSpoken = false;
+    if (state.recorderContext) state.recorderContext.accepted = false;
+    state.recorder.stop();
+  }
+  setHeard(question);
+  setPhase("thinking", "Finding source evidence for the typed question.");
+  elements.textQuestion.disabled = true;
+  try {
+    const answerData = await requestAnswer(question);
+    renderAnswer(answerData);
+    elements.textQuestion.value = "";
+    if (wasActive) armNextTurn("Typed answer ready. Pitchroom is listening again.");
+    else setPhase("ready", "Grounded answer ready.");
+  } catch (error) {
+    showError(`Could not answer this question: ${error.message}`, wasActive);
+    if (wasActive) armNextTurn("Pitchroom is listening again.");
+  } finally {
+    elements.textQuestion.disabled = false;
+  }
+}
+
+async function manuallyPlayAnswer() {
+  if (!state.lastAnswer) return;
+  clearError();
+  elements.playAnswer.disabled = true;
+  try {
+    if (state.active) await pauseCaptureForPlayback();
+    if (state.currentAudio && state.currentAudio.src) {
+      state.speakingStartedAt = performance.now();
+      setPhase("speaking", "Pitchroom is answering aloud.");
+      await state.currentAudio.play();
+      if (state.active) startRecorder("barge");
+      return;
+    }
+    const blob = await requestSpeech(state.lastAnswer);
+    await playBlob(blob, state.active);
+  } catch (error) {
+    showError(`Could not play the answer: ${error.message}`, true);
+  } finally {
+    elements.playAnswer.disabled = false;
+  }
+}
+
+function bindEvents() {
+  elements.topToggle.addEventListener("click", startLiveSession);
+  elements.stageToggle.addEventListener("click", startLiveSession);
+  elements.demoReset.addEventListener("click", resetDemo);
+  elements.demoResetSource.addEventListener("click", resetDemo);
+  elements.sourceUpload.addEventListener("change", (event) => uploadPitch(event.target.files?.[0]));
+  elements.textQuestionForm.addEventListener("submit", askTypedQuestion);
+  elements.playAnswer.addEventListener("click", manuallyPlayAnswer);
+  window.addEventListener("beforeunload", stopLiveSession);
+}
+
+async function initialise() {
+  bindEvents();
+  try {
+    await loadPitch();
+  } catch (error) {
+    showError(`Could not load the approved source: ${error.message}`);
+  }
+  setAnswerPlaceholder();
+  setPhase("ready");
+}
+
+initialise();
