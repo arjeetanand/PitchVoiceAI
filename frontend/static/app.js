@@ -68,6 +68,9 @@ const state = {
   currentAudio: null,
   currentAudioUrl: null,
   playbackId: 0,
+  currentSpeech: null,
+  browserSpeechId: 0,
+  browserSpeechCancel: null,
   speakingStartedAt: 0,
   bargeCandidateAt: 0,
   turnEpoch: 0,
@@ -268,6 +271,12 @@ function clearAudio() {
   // Invalidate callbacks before touching the element. Removing an audio source
   // may still dispatch a late error event in some browsers.
   state.playbackId += 1;
+  state.browserSpeechId += 1;
+  const cancelBrowserSpeech = state.browserSpeechCancel;
+  state.browserSpeechCancel = null;
+  if (cancelBrowserSpeech) cancelBrowserSpeech();
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  state.currentSpeech = null;
   const audio = state.currentAudio;
   const audioUrl = state.currentAudioUrl;
   state.currentAudio = null;
@@ -377,7 +386,7 @@ function confirmBargeIn() {
 }
 
 function detectBargeIn(rms, now) {
-  if (!state.currentAudio || now - state.speakingStartedAt < BARGE_IN_GRACE_MS) return;
+  if ((!state.currentAudio && !state.currentSpeech) || now - state.speakingStartedAt < BARGE_IN_GRACE_MS) return;
   const threshold = Math.max(BARGE_IN_MIN_THRESHOLD, state.voiceThreshold * BARGE_IN_THRESHOLD_MULTIPLIER);
   if (rms <= threshold) {
     if (state.bargeCandidateAt) discardBargeCapture();
@@ -549,9 +558,90 @@ async function requestSpeech(text, signal) {
   if (!response.ok) {
     let body = null;
     try { body = await response.json(); } catch (_) { /* preserve fallback below */ }
-    throw new Error(responseDetail(body, `Speech request failed (${response.status}).`));
+    const error = new Error(responseDetail(body, `Speech request failed (${response.status}).`));
+    error.status = response.status;
+    throw error;
   }
   return response.blob();
+}
+
+function selectBrowserVoice() {
+  if (!window.speechSynthesis?.getVoices) return null;
+  const voices = window.speechSynthesis.getVoices();
+  return voices.find((voice) => /en-IN/i.test(voice.lang))
+    || voices.find((voice) => /en-US|en-GB/i.test(voice.lang))
+    || voices[0]
+    || null;
+}
+
+function playBrowserSpeech(text, resumeWhenFinished) {
+  if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+    throw new Error("This browser does not provide a local speech voice.");
+  }
+  clearAudio();
+  const browserSpeechId = state.browserSpeechId;
+  const utterance = new window.SpeechSynthesisUtterance(text);
+  const voice = selectBrowserVoice();
+  utterance.lang = voice?.lang || "en-IN";
+  utterance.rate = 0.98;
+  utterance.pitch = 1;
+  if (voice) utterance.voice = voice;
+  state.currentSpeech = utterance;
+  state.speakingStartedAt = performance.now();
+  setPhase("speaking", "Pitchroom is answering with the free browser voice. Speak over it to interrupt.");
+  elements.stageCopy.textContent = "Using the free browser voice locally. Speak over the reply to interrupt it.";
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      const isCurrent = browserSpeechId === state.browserSpeechId && state.currentSpeech === utterance;
+      if (state.browserSpeechCancel === cancel) state.browserSpeechCancel = null;
+      if (state.currentSpeech === utterance) state.currentSpeech = null;
+      if (!isCurrent) {
+        resolve();
+        return;
+      }
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (resumeWhenFinished || state.active) armNextTurn("Answer complete. Pitchroom is listening again.");
+      else setPhase("ready", "Answer playback complete.");
+      resolve();
+    };
+    const cancel = () => finish();
+    state.browserSpeechCancel = cancel;
+    utterance.onend = () => finish();
+    utterance.onerror = (event) => {
+      const reason = event?.error ? ` (${event.error})` : "";
+      finish(new Error(`The local browser voice could not speak${reason}.`));
+    };
+    try {
+      window.speechSynthesis.speak(utterance);
+      if (state.active && resumeWhenFinished) startRecorder("barge");
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error("The local browser voice could not start."));
+    }
+  });
+}
+
+async function playAnswer(text, resumeWhenFinished, signal) {
+  try {
+    const speechBlob = await requestSpeech(text, signal);
+    if (signal?.aborted) throw new DOMException("The speech request was aborted.", "AbortError");
+    await playBlob(speechBlob, resumeWhenFinished);
+  } catch (error) {
+    if (error?.name === "AbortError" || signal?.aborted) throw error;
+    const serverMessage = error?.message || "The server speech provider is unavailable.";
+    elements.liveAnnouncement.textContent = "Server voice unavailable. Switching to the free browser voice.";
+    try {
+      await playBrowserSpeech(text, resumeWhenFinished);
+    } catch (browserError) {
+      throw new Error(`${serverMessage} Browser voice fallback failed: ${browserError?.message || "unknown error."}`);
+    }
+  }
 }
 
 async function playBlob(blob, resumeWhenFinished) {
@@ -607,9 +697,8 @@ async function processVoiceTurn(blob, sessionId, turnEpoch) {
     if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
     renderAnswer(answerData);
     try {
-      const speechBlob = await requestSpeech(answerData.answer, controller.signal);
       if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
-      await playBlob(speechBlob, true);
+      await playAnswer(answerData.answer, true, controller.signal);
     } catch (speechError) {
       if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
       showError(`The grounded answer is ready, but voice playback is unavailable: ${speechError.message}`, true);
@@ -669,8 +758,7 @@ async function manuallyPlayAnswer() {
       if (state.active) startRecorder("barge");
       return;
     }
-    const blob = await requestSpeech(state.lastAnswer);
-    await playBlob(blob, state.active);
+    await playAnswer(state.lastAnswer, state.active);
   } catch (error) {
     showError(`Could not play the answer: ${error.message}`, true);
   } finally {

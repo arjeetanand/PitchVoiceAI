@@ -36,13 +36,15 @@ Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The included `pitch.txt` br
 
 Copy `backend/.env.example` to the repository-root `.env` and configure only the providers you use:
 
-- `SARVAM_API_KEY` enables the preferred Sarvam Bulbul speech path.
+- `TTS_PROVIDER=auto` enables the configured server-provider chain; add `SARVAM_API_KEY` to include Sarvam Bulbul.
 - `HUGGINGFACE_API_TOKEN` enables Whisper transcription and optionally Hugging Face answer generation.
 - `OPENAI_API_KEY` enables the OpenAI text-to-speech fallback.
+- `TTS_PROVIDER=browser` forces the free browser-native voice; it needs no API key and keeps reply text in the browser.
+- `TTS_PROVIDER=piper` plus `PIPER_TTS_URL` uses a free local Piper neural voice. Setup commands are in [backend/README.md](backend/README.md).
 
-Pitchroom uses deterministic extractive answers by default, which makes the demo fast and auditable. Set `ANSWER_GENERATION_PROVIDER=huggingface` only after testing the configured hosted model. `MAX_AUDIO_BYTES` defaults to 10 MiB. The shipped browser UI calls the same-origin `/api` path.
+Pitchroom uses deterministic extractive answers by default, which makes the demo fast and auditable. Set `ANSWER_GENERATION_PROVIDER=huggingface` only after testing the configured hosted model. `MAX_AUDIO_BYTES` defaults to 10 MiB. In `auto` mode, configured server speech providers are tried before the browser voice fallback; `browser` is the safest no-cost demo setting.
 
-Voice requests send the recorded audio and the requested text to the configured third-party providers. Use only a non-sensitive demo brief unless your organization has approved that data handling.
+Voice requests send recorded audio and, when a server TTS provider is selected, reply text to those configured third-party providers. With `TTS_PROVIDER=browser`, reply text is synthesized locally by the browser. Use only a non-sensitive demo brief unless your organization has approved that data handling.
 
 The live microphone session needs a current desktop browser and HTTPS in deployment (`localhost` is permitted for local development). Chrome or Edge is the recommended presentation browser. The browser may require one tap on **Play answer** if its autoplay policy blocks an asynchronous reply; the room continues listening either way.
 
@@ -66,6 +68,6 @@ node --check frontend/static/app.js
 
 ## Deployment
 
-`render.yaml` exposes one FastAPI service that serves both the static live room and `/api` from the same public origin. Set the required provider keys as Render secret environment variables. HTTPS is required for microphone capture outside local development.
+`render.yaml` exposes one FastAPI service that serves both the static live room and `/api` from the same public origin. The default Render template uses the free browser voice, so only the transcription token is needed for live speech; add Sarvam or another server provider only if you want its voice. HTTPS is required for microphone capture outside local development.
 
 Before presenting from a deployed service, use a non-sensitive source document, run the microphone check in the target browser, make one automatic-pause voice turn, and verify that a spoken interruption starts a fresh turn.

@@ -61,6 +61,19 @@ def _answer_generation_provider() -> str:
     return "huggingface" if configured in {"huggingface", "hf"} else "extractive"
 
 
+def _tts_provider_preference() -> str:
+    """Return the requested speech path; browser voice is the safe default."""
+    configured = _setting("TTS_PROVIDER", "browser").lower()
+    aliases = {
+        "web": "browser",
+        "browser-native": "browser",
+        "local-piper": "piper",
+        "hf": "huggingface",
+    }
+    configured = aliases.get(configured, configured)
+    return configured if configured in {"auto", "browser", "piper", "sarvam", "huggingface", "openai"} else "auto"
+
+
 def _audio_upload_limit() -> int:
     try:
         configured = int(_setting("MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES)))
@@ -292,6 +305,34 @@ def _huggingface_audio(text: str) -> bytes:
     return _huggingface_request(model, json.dumps({"inputs": text}).encode(), "application/json")
 
 
+def _piper_audio(text: str, voice: str | None = None) -> bytes:
+    """Call an optional local Piper HTTP server; Piper itself is keyless."""
+    url = _setting("PIPER_TTS_URL", "")
+    if not url:
+        raise RuntimeError("PIPER_TTS_URL is not configured")
+    payload: dict[str, str] = {"text": text}
+    configured_voice = voice or _setting("PIPER_TTS_VOICE", "")
+    if configured_voice:
+        payload["voice"] = configured_voice
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            audio = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"Piper text-to-speech failed: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError("The local Piper speech service could not be reached.") from exc
+    if not audio:
+        raise RuntimeError("Piper returned no audio.")
+    return audio
+
+
 def _sarvam_audio(text: str) -> bytes:
     api_key = _setting("SARVAM_API_KEY", "")
     if not api_key:
@@ -416,6 +457,12 @@ def _huggingface_transcription(audio: bytes, content_type: str) -> str:
 
 
 def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
+    preference = _tts_provider_preference()
+    if preference == "browser":
+        raise RuntimeError("Browser voice is selected; the browser will synthesize this answer locally.")
+    if preference == "piper":
+        return _piper_audio(text, voice), "audio/wav"
+
     errors: list[str] = []
     if _setting("SARVAM_API_KEY", ""):
         try:
@@ -423,7 +470,13 @@ def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
         except RuntimeError as exc:
             errors.append(f"Sarvam: {exc}")
 
-    mode = _setting("HUGGINGFACE_TTS_MODE", "local").lower()
+    if _setting("PIPER_TTS_URL", ""):
+        try:
+            return _piper_audio(text, voice), "audio/wav"
+        except RuntimeError as exc:
+            errors.append(f"Piper: {exc}")
+
+    mode = _setting("HUGGINGFACE_TTS_MODE", "off").lower()
     if mode == "local":
         try:
             return _local_huggingface_audio(text), "audio/wav"
@@ -447,20 +500,29 @@ def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
         raise RuntimeError("All configured text-to-speech providers failed: " + "; ".join(errors))
 
     raise RuntimeError(
-        "No speech provider is configured. Set SARVAM_API_KEY, HUGGINGFACE_API_TOKEN, or OPENAI_API_KEY in .env."
+        "No server speech provider is configured. Set PIPER_TTS_URL for free local Piper, or configure a hosted provider."
     )
 
 
 def _speech_provider() -> str:
+    preference = _tts_provider_preference()
+    if preference == "browser":
+        return "browser"
+    if preference == "piper":
+        return "piper" if _setting("PIPER_TTS_URL", "") else "piper-unconfigured"
     if _setting("SARVAM_API_KEY", ""):
         return "sarvam"
-    if _setting("HUGGINGFACE_TTS_MODE", "local").lower() == "local":
+    if _setting("PIPER_TTS_URL", ""):
+        return "piper"
+    if _setting("HUGGINGFACE_TTS_MODE", "off").lower() == "local":
         return "huggingface-local"
     if _setting("HUGGINGFACE_API_TOKEN", ""):
         return "huggingface-api"
     if _setting("OPENAI_API_KEY", ""):
         return "openai"
-    return "none"
+    # The shipped browser room has a no-key SpeechSynthesis fallback even when
+    # no server-side voice is configured.
+    return "browser"
 
 
 @router.get("/health")
@@ -471,6 +533,7 @@ def health() -> dict[str, Any]:
         "document_source": store.source,
         "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
         "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
+        "piper_configured": bool(_setting("PIPER_TTS_URL", "")),
         "openai_configured": bool(_setting("OPENAI_API_KEY", "")),
         "speech_provider": _speech_provider(),
     }

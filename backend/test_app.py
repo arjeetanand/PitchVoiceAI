@@ -163,6 +163,7 @@ def test_speak_requires_provider_configuration(monkeypatch) -> None:
     monkeypatch.delenv("SARVAM_API_KEY", raising=False)
     monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "api")
 
     response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
@@ -182,6 +183,7 @@ def _wav_bytes() -> bytes:
 
 def test_sarvam_speech_response_advertises_wav(monkeypatch) -> None:
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     monkeypatch.setattr(pitch_routes, "_sarvam_audio", lambda text: _wav_bytes())
 
     response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
@@ -193,6 +195,7 @@ def test_sarvam_speech_response_advertises_wav(monkeypatch) -> None:
 
 def test_sarvam_payload_uses_current_language_code_field(monkeypatch) -> None:
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     captured: dict[str, object] = {}
 
     class FakeResponse:
@@ -218,8 +221,43 @@ def test_sarvam_payload_uses_current_language_code_field(monkeypatch) -> None:
     assert "target_language_code" not in payload
 
 
+def test_piper_speech_response_uses_local_http_service(monkeypatch) -> None:
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TTS_PROVIDER", "piper")
+    monkeypatch.setenv("PIPER_TTS_URL", "http://127.0.0.1:5000/synthesize")
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return _wav_bytes()
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr(pitch_routes.urllib.request, "urlopen", fake_urlopen)
+
+    response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/wav")
+    assert response.content.startswith(b"RIFF")
+    assert captured["url"] == "http://127.0.0.1:5000/synthesize"
+    assert captured["payload"] == {"text": "Read this pitch."}
+
+
 def test_sarvam_failure_falls_back_to_openai(monkeypatch) -> None:
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
     monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "api")
@@ -239,6 +277,7 @@ def test_sarvam_failure_falls_back_to_openai(monkeypatch) -> None:
 
 def test_speak_aggregates_errors_only_after_all_configured_providers_fail(monkeypatch) -> None:
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
     monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "api")
@@ -266,6 +305,7 @@ def test_openai_is_used_when_local_huggingface_tts_is_unavailable(monkeypatch) -
     monkeypatch.delenv("SARVAM_API_KEY", raising=False)
     monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_PROVIDER", "auto")
     monkeypatch.setenv("HUGGINGFACE_TTS_MODE", "local")
     monkeypatch.setattr(
         pitch_routes,

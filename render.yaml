@@ -12,7 +12,9 @@ services:
         sync: false
       - key: SARVAM_API_KEY
         sync: false
+      - key: TTS_PROVIDER
+        value: browser
       - key: PITCH_DOCUMENT_PATH
         value: ./data/pitch.txt
       - key: HUGGINGFACE_TTS_MODE
-        value: local
+        value: off

@@ -43,7 +43,7 @@ Do not say:
 3. Ask: “What problem does Pitchroom AI solve?” then stop speaking normally.
 4. Point out that no record-stop action is needed: the pause sent the turn.
 5. Point to **Heard**, the grounded answer, and **Source evidence**.
-6. Let the spoken reply end and call out that the room is listening again.
+6. Let the spoken reply end and call out that the room is listening again. If Sarvam is not configured, say that the answer is being spoken by the free browser voice.
 7. For a memorable live moment, speak over the reply with: “And what happens if there is no evidence?” Point out that the reply stops and the new question is captured without a second microphone click.
 
 ### 1:40–2:00 — Trust moment and close
@@ -78,7 +78,7 @@ Use the included demo brief only for practice. Before using an actual company pi
 | If this happens | Do this |
 | --- | --- |
 | Microphone permission fails | Use a demo question by text and explain that the transcript plus answer path is identical after speech-to-text. |
-| Venue audio is unreliable | Use **Play answer** if the browser permits it, then continue with the visible transcript and source evidence. |
+| Venue audio is unreliable | Use headphones, choose `TTS_PROVIDER=browser`, or use **Play answer** if the browser permits it, then continue with the visible transcript and source evidence. |
 | A provider is slow | Use the three scripted text questions, then show the source sections. |
 | The question gets no match | Treat it as the trust moment. Say the source does not support the claim. |
 | A real deck has image-only slides | Use a short text-based demo brief with the key facts written as clear sentences. |
