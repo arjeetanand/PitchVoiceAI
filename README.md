@@ -13,10 +13,11 @@ Pitchroom AI gives founder-led teams a rehearsal space that keeps the approved s
 ## What the prototype does
 
 - Loads selectable-text PDFs, Markdown, and plain-text pitch documents.
-- Retrieves the most relevant source sections for a question.
-- Supports typed questions and a browser-native live voice session.
-- Runs a hands-free voice turn: speech detected → short pause detected → speech-to-text → source-grounded answer → text-to-speech → microphone re-armed. Speaking over a reply interrupts it and starts the next turn.
-- Shows the transcript, answer, and source sections used.
+- Retrieves the most relevant source sections for each question.
+- Supports typed questions and one-tap live voice conversations.
+- Runs hands-free turns: speech detected → pause detected → transcription → grounded answer → spoken reply → microphone re-armed.
+- Stops a spoken reply when the presenter interrupts and treats the interruption as the next question.
+- Shows the transcript, answer, and exact source sections used.
 - Includes a verified demo brief with facts about the working prototype.
 
 The experience is seamless turn-taking, not streaming transcription: a presenter starts the room once, then a short pause ends each question automatically. The active document stays in memory and is shared by the running API, so this is suitable for a controlled hackathon demo rather than multi-user production use.
@@ -25,22 +26,46 @@ The experience is seamless turn-taking, not streaming transcription: a presenter
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m pip install -r backend/requirements-kokoro.txt
 cp .env.example .env
 ./run-dev.sh
 ```
 
-Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The included `pitch.txt` brief loads automatically. Use **Start live session** once, ask naturally, and pause to send the question. Use **Use demo brief** whenever a rehearsal needs a clean reset. Upload an approved text-based PDF, Markdown, or TXT file when rehearsing your own pitch.
+The Kokoro requirements are the recommended presentation install. They include
+the base API dependencies and the local studio voice. If you only need typed
+questions or the zero-install browser voice, install `backend/requirements.txt`
+instead and set `TTS_PROVIDER=browser`.
+
+Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The included `pitch.txt`
+brief loads automatically. Use **Start live session** once, ask naturally, and
+pause to send the question. The reply stops if you speak over it, and the same
+session listens for the next question automatically. Use **Use demo brief** for
+a clean reset, or upload an approved PDF, Markdown, or TXT file for rehearsal.
 
 ## Configuration
 
 There is one configuration file: the repository-root `.env`. Start from the
 categorized [`.env.example`](.env.example), copy it to `.env`, and change only
-the values needed for your demo. The backend, deployment template, and legacy
-Streamlit wrapper all use this same configuration contract; there is no second
-backend env file.
+the values needed for your demo. The backend and deployment template use this
+same configuration contract; there is no second backend or frontend env file.
 
-The most important settings are:
+For the local presentation voice, set:
+
+```dotenv
+TTS_PROVIDER=kokoro
+KOKORO_LANG_CODE=a
+KOKORO_VOICE=af_heart
+KOKORO_SPEED=0.98
+KOKORO_DEVICE=auto
+```
+
+Live microphone transcription also needs a Hugging Face token in `.env`:
+
+```dotenv
+HUGGINGFACE_API_TOKEN=your_token_here
+```
+
+The important provider choices are:
 
 - `TTS_PROVIDER=kokoro` is the recommended hackathon studio voice: a local, cached Kokoro English model with the curated `af_heart` narrator. Install it with `.venv/bin/python -m pip install -r backend/requirements-kokoro.txt`; its first model download is about 360 MB, then answer text stays on the presentation machine with no per-request TTS charge.
 - `TTS_PROVIDER=auto` enables the configured server-provider chain; add `SARVAM_API_KEY` to include Sarvam Bulbul.
@@ -49,10 +74,10 @@ The most important settings are:
 - `TTS_PROVIDER=browser` forces the free browser-native voice; it needs no API key and keeps reply text in the browser.
 - `TTS_PROVIDER=piper` plus `PIPER_TTS_URL` uses a free local Piper neural voice. Setup commands are in [backend/README.md](backend/README.md).
 
-The remaining provider settings are grouped in `.env.example` under speech-to-
-text, local voice, hosted voice, and legacy-wrapper sections. You do not need
-to fill every key. The old `assembleAI` entry is not part of the supported
-configuration because no current code uses it.
+The remaining provider settings are grouped in `.env.example` under runtime,
+speech-to-text, local voice, and hosted voice sections. You do not need to fill
+every key. Typed questions and browser speech work without a provider key;
+live microphone transcription uses the configured Hugging Face Whisper path.
 
 Kokoro starts warming as the live room opens, loading its model and narrator while the presenter gets ready. On its first install it downloads the public model artifacts from Hugging Face (not your answer text); after that cache is present, answers stay on the presentation machine and the demo can run offline for TTS. For the first launch, wait until the page is fully open before the first question; later answers use the in-memory model. This avoids a provider round trip, but it is not literal streaming audio—keep live answers to one to three sentences for the quickest response. Use `KOKORO_VOICE=af_bella` to audition the alternative high-quality English narrator, then keep one voice consistent for the demo.
 
@@ -60,7 +85,22 @@ Pitchroom uses deterministic extractive answers by default, which makes the demo
 
 Voice requests send recorded audio and, when a hosted server TTS provider is selected, reply text to those configured third-party providers. With `TTS_PROVIDER=browser` or `TTS_PROVIDER=kokoro`, reply text is synthesized locally. The live transcription path still uses the configured speech-to-text provider. Use only a non-sensitive demo brief unless your organization has approved that data handling.
 
-The live microphone session needs a current desktop browser and HTTPS in deployment (`localhost` is permitted for local development). Chrome or Edge is the recommended presentation browser. The browser may require one tap on **Play answer** if its autoplay policy blocks an asynchronous reply; the room continues listening either way.
+The live microphone session needs a current desktop browser and HTTPS in
+deployment (`localhost` is permitted for local development). Chrome or Edge is
+the recommended presentation browser. Headphones are the most reliable setup
+for interruption because acoustic echo cancellation varies by venue.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `frontend/static/` | The dependency-free browser live room, voice orb, VAD, barge-in handling, transcript, and source evidence UI. |
+| `backend/app.py` | FastAPI entrypoint; serves the browser room and `/api` from one origin. |
+| `backend/routes/pitch.py` | Document ingestion, grounded answers, transcription, and speech-provider integrations. |
+| `backend/config.py` | Loads the root `.env` and owns the supported setting names and defaults. |
+| `backend/data/pitch.txt` | Verified demo brief used by **Use demo brief**. |
+| `run-dev.sh` | Local development server on port 8501. |
+| `render-start.sh` | Render production start command. |
 
 ## Hackathon demo sequence
 
@@ -82,6 +122,11 @@ node --check frontend/static/app.js
 
 ## Deployment
 
-`render.yaml` exposes one FastAPI service that serves both the static live room and `/api` from the same public origin. The default Render template uses the free browser voice, so only the transcription token is needed for live speech; run Kokoro locally for the polished in-person presentation voice, or add Sarvam or another server provider only if you want its voice. HTTPS is required for microphone capture outside local development.
+`render.yaml` exposes one FastAPI service that serves both the static live room
+and `/api` from the same public origin. Render uses the free browser voice by
+default, so only `HUGGINGFACE_API_TOKEN` is needed for live speech. Run Kokoro
+locally for the polished in-person presentation voice, or configure another
+server provider only when you intentionally need it. HTTPS is required for
+microphone capture outside local development.
 
 Before presenting from a deployed service, use a non-sensitive source document, run the microphone check in the target browser, make one automatic-pause voice turn, and verify that a spoken interruption starts a fresh turn.

@@ -2,6 +2,10 @@
 
 `static/` is a dependency-free browser application served by FastAPI at `/`. It is designed for a hackathon presentation rather than a manual recorder workflow.
 
+There is no separate Python frontend process; start the backend with the root
+`./run-dev.sh` command and it serves this browser application and the API from
+the same origin.
+
 ## Run
 
 From the repository root:

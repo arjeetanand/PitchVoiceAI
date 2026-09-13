@@ -51,9 +51,6 @@ DEFAULTS: dict[str, str] = {
     "HUGGINGFACE_TTS_MODEL": "suno/bark-small",
     "HUGGINGFACE_TTS_VOICE": "v2/en_speaker_6",
     "HUGGINGFACE_TTS_MEDIA_TYPE": "audio/wav",
-    # These two belong only to the legacy Streamlit wrapper.
-    "BACKEND_URL": "http://localhost:8000",
-    "ALLOW_CUSTOM_BACKEND_URL": "false",
 }
 
 
