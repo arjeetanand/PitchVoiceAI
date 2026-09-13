@@ -29,6 +29,6 @@ An explicit **End live session** control stays available. A typed source-questio
 
 ## Visual layer
 
-`static/scene.js` lazily imports a pinned Three.js module and renders one decorative, scroll-responsive particle field behind the semantic page. It morphs through the five story scenes and gently responds to voice state and microphone energy, while the actual controls, transcript, and evidence remain ordinary accessible HTML.
+`static/scene.js` lazily imports a pinned Three.js module and renders one decorative, scroll-responsive particle field behind the semantic page. It morphs through the five story scenes, follows pointer movement with eased parallax, and uses a small shader layer to vary particle z-depth, scale, brightness, and cursor wake across the field. Three orbit rails add a readable spatial cue without turning the page into an opaque 3D overlay. Voice state and microphone energy still influence the field, while the actual controls, transcript, and evidence remain ordinary accessible HTML.
 
 The visual layer caps device pixel ratio and particle density, pauses when the document is hidden, and respects `prefers-reduced-motion`. If the optional module cannot be reached—for example, on a presentation network that blocks the CDN—the canvas hides and the live room remains fully usable.
