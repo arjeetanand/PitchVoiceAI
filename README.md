@@ -2,7 +2,7 @@
 
 **Every answer, from the deck.**
 
-Pitchroom AI turns an approved, text-based pitch into a source-grounded voice rehearsal. A founder can load a pitch, ask a question aloud, see what the system heard, inspect the supporting source sections, and hear the answer back.
+Pitchroom AI turns an approved pitch deck or document into a source-grounded voice rehearsal. A founder can load a pitch, ask a question aloud, see what the system heard, inspect the supporting slide/page sections, and hear the answer back.
 
 ## The problem
 
@@ -12,7 +12,11 @@ Pitchroom AI gives founder-led teams a rehearsal space that keeps the approved s
 
 ## What the prototype does
 
-- Loads selectable-text PDFs, Markdown, and plain-text pitch documents.
+- Loads PPTX, selectable-text PDF, DOCX, Markdown, and plain-text pitch documents.
+- Preserves slide/page provenance, including PPTX speaker notes, and shows the
+  citation beside each grounded answer.
+- Reports image-only slides/pages as review warnings instead of silently
+  pretending that charts or screenshots were understood.
 - Retrieves the most relevant source sections for each question.
 - Supports typed questions and one-tap live voice conversations.
 - Runs hands-free turns: speech detected → pause detected → transcription → grounded answer → spoken reply → microphone re-armed.
@@ -41,7 +45,9 @@ Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The included `pitch.txt`
 brief loads automatically. Use **Start live session** once, ask naturally, and
 pause to send the question. The reply stops if you speak over it, and the same
 session listens for the next question automatically. Use **Use demo brief** for
-a clean reset, or upload an approved PDF, Markdown, or TXT file for rehearsal.
+a clean reset, or upload an approved PPTX, PDF, DOCX, Markdown, or TXT file
+for rehearsal. Legacy binary `.ppt` files are converted only when LibreOffice
+is available; exporting to `.pptx` is the reliable path.
 
 ## Configuration
 
@@ -106,13 +112,20 @@ for interruption because acoustic echo cancellation varies by venue.
 ## Hackathon demo sequence
 
 1. Start with the problem: static decks do not answer live questions.
-2. Point to the visible approved source and select **Use demo brief** if needed.
+2. Upload the real `.pptx` when the deck is text-selectable, then point to the
+   visible slide/page extraction status. Use **Use demo brief** if needed.
 3. Start the live session once and say: “What problem does Pitchroom AI solve?”
 4. Pause; point out that the turn sends automatically, with no record-stop control.
 5. Point to **Heard**, the grounded answer, the exact source evidence, and the spoken reply.
 6. Ask an unsupported question, such as “What is the Series B valuation?” Explain that refusal is the trust feature.
 
+For a real judging demo, keep a text-selectable deck or exported PDF ready. A
+slide that is only a screenshot or chart is surfaced as a review warning; it is
+not silently treated as reliable evidence.
+
 The full speaking script and fallback plan are in [docs/hackathon-runbook.md](docs/hackathon-runbook.md).
+The format support, trust boundary, and production path are in
+[presentation-product-plan.md](presentation-product-plan.md).
 
 ## Testing
 

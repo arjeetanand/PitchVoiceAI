@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import wave
+import zipfile
 
 from pathlib import Path
 
@@ -19,6 +20,8 @@ client = TestClient(app.app)
 def setup_function() -> None:
     app.store.path = Path("missing-pitch.txt")
     app.store.text = ""
+    app.store.sections = []
+    app.store.metadata = {"format": "text", "sections": 0, "warnings": []}
     app.store.source = "test"
 
 
@@ -138,6 +141,24 @@ def test_answer_keeps_the_best_source_section_for_a_scripted_demo_question() -> 
     assert "static pitch decks" not in body["answer"]
 
 
+def test_retrieval_ignores_question_fillers_when_finding_file_support() -> None:
+    client.post(
+        "/api/pitch/document",
+        json={
+            "document": (
+                "Pitchroom AI turns an approved pitch deck or document into a voice conversation by accepting PPTX, PDF, DOCX, Markdown, or plain-text sources. "
+                "Pitchroom AI keeps the supporting source visible during every answer."
+            )
+        },
+    )
+
+    response = client.post("/api/voice/answer", json={"question": "What file types can Pitchroom accept?"})
+
+    assert response.status_code == 200
+    assert response.json()["grounded"] is True
+    assert "PPTX" in response.json()["answer"]
+
+
 def test_pdf_upload_extracts_text() -> None:
     document = pymupdf.open()
     page = document.new_page()
@@ -153,6 +174,66 @@ def test_pdf_upload_extracts_text() -> None:
     assert response.status_code == 200
     pitch = client.get("/api/pitch").json()
     assert "customer demos" in pitch["text"]
+    assert pitch["metadata"]["format"] == "pdf"
+    assert pitch["sections"][0]["citation"] == "Page 1"
+
+
+def test_pptx_upload_preserves_slide_sections_and_citations() -> None:
+    response = client.post(
+        "/api/pitch/file",
+        files={
+            "file": (
+                "investor-deck.pptx",
+                _pptx_bytes(
+                    "The problem is slow investor preparation.",
+                    "Pitchroom answers founder questions from the approved deck.",
+                ),
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "investor-deck.pptx"
+    assert body["metadata"]["format"] == "pptx"
+    assert body["metadata"]["slides"] == 2
+    assert body["metadata"]["warnings"] == []
+
+    answer = client.post("/api/voice/answer", json={"question": "What does Pitchroom answer?"})
+    assert answer.status_code == 200
+    assert answer.json()["source_refs"][0]["citation"] == "Slide 2"
+
+
+def test_docx_upload_extracts_paragraphs() -> None:
+    response = client.post(
+        "/api/pitch/file",
+        files={
+            "file": (
+                "brief.docx",
+                _docx_bytes("Customer interviews reveal a trust gap.", "The rehearsal keeps evidence visible."),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["metadata"]["format"] == "docx"
+    assert body["chunks"] == 2
+    assert client.get("/api/pitch").json()["sections"][1]["citation"] == "Document section 2"
+
+
+def test_document_upload_enforces_the_configured_size_limit(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_DOCUMENT_BYTES", "4")
+
+    response = client.post(
+        "/api/pitch/file",
+        files={"file": ("pitch.txt", b"12345", "text/plain")},
+    )
+
+    assert response.status_code == 413
+    assert "at most 4 bytes" in response.json()["detail"]
 
 
 def test_markdown_upload_accepts_generic_content_type() -> None:
@@ -193,6 +274,41 @@ def _wav_bytes() -> bytes:
         audio.setsampwidth(2)
         audio.setframerate(8000)
         audio.writeframes(b"\x00\x00" * 16)
+    return buffer.getvalue()
+
+
+def _pptx_bytes(*slides: str) -> bytes:
+    """Small OOXML fixture that exercises the same parser as real PPTX files."""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for index, text in enumerate(slides, start=1):
+            escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            archive.writestr(
+                f"ppt/slides/slide{index}.xml",
+                (
+                    '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                    f"<p:cSld><a:p><a:r><a:t>{escaped}</a:t></a:r></a:p></p:cSld></p:sld>"
+                ),
+            )
+    return buffer.getvalue()
+
+
+def _docx_bytes(*paragraphs: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        body = "".join(
+            f'<w:p><w:r><w:t>{text}</w:t></w:r></w:p>'
+            for text in paragraphs
+        )
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f"<w:body>{body}</w:body></w:document>"
+            ),
+        )
     return buffer.getvalue()
 
 

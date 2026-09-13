@@ -22,6 +22,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULTS: dict[str, str] = {
     "PITCH_DOCUMENT_PATH": "./data/pitch.txt",
     "MAX_DOCUMENT_CHARS": "50000",
+    "MAX_DOCUMENT_BYTES": str(25 * 1024 * 1024),
     "MAX_AUDIO_BYTES": str(10 * 1024 * 1024),
     "FRONTEND_ORIGINS": (
         "http://127.0.0.1:8501,http://localhost:8501,"

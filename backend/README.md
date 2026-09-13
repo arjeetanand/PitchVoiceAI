@@ -21,11 +21,11 @@ The API runs at `http://localhost:8000` when launched directly. The repository's
 ## Routes
 
 - `GET /health` checks service and document state.
-- `GET /api/pitch` returns the loaded pitch and sentence chunks.
+- `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata.
 - `POST /api/pitch/demo` restores the included Pitchroom demo brief.
 - `POST /api/pitch/document` accepts `{ "document": "..." }`.
-- `POST /api/pitch/file` accepts a PDF, plain-text, or Markdown upload. PDF text is extracted page by page with PyMuPDF.
-- `POST /api/voice/answer` accepts `{ "question": "..." }` and returns a grounded answer plus source chunks. The frontend can send speech-to-text output here.
+- `POST /api/pitch/file` accepts PPTX, selectable-text PDF, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted page by page with PyMuPDF; DOCX paragraphs are extracted from OOXML. Legacy `.ppt` files use LibreOffice when it is installed.
+- `POST /api/voice/answer` accepts `{ "question": "..." }` and returns a grounded answer, source chunks, and `source_refs` such as `Slide 4` or `Page 2`. The frontend can send speech-to-text output here.
 - `POST /api/pitch/read` returns audio for the loaded pitch. Kokoro, Sarvam, Piper, local Hugging Face, and Hugging Face API output WAV; OpenAI output is MP3.
 - `POST /api/voice/speak` accepts `{ "text": "...", "voice": "alloy" }` and returns audio with the correct `Content-Type`.
 - `POST /api/voice/warm` warms the explicitly selected local Kokoro voice without invoking any hosted provider. The browser room calls this on load.
@@ -75,6 +75,11 @@ transcription. `FRONTEND_ORIGINS` is only needed if a separate frontend origin
 will call the API; the shipped live room uses the same origin. Use a
 non-sensitive demo source because configured providers receive audio and text
 needed to process a voice turn.
+
+Document ingestion is intentionally honest: embedded images, scanned pages, and
+chart-only slides are counted and returned as review warnings. The current
+retrieval path can answer from selectable text, tables, and speaker notes; add
+OCR/vision extraction before claiming that arbitrary visual claims are covered.
 
 ## Tests
 

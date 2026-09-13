@@ -6,14 +6,20 @@ import base64
 import binascii
 import os
 import re
+import shutil
 import sys
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 import wave
+import zipfile
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 from typing import Any
+from xml.etree import ElementTree
 
 import pymupdf
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -26,8 +32,9 @@ from config import setting as _setting
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DOCUMENT = BACKEND_DIR / "data" / "pitch.txt"
 STOP_WORDS = {
-    "a", "an", "and", "are", "does", "how", "in", "is", "it", "of",
-    "the", "to", "what", "when", "where", "who", "why",
+    "a", "an", "and", "are", "can", "could", "does", "give", "how",
+    "in", "is", "it", "of", "please", "tell", "the", "to", "what",
+    "when", "where", "who", "why",
 }
 # Keep tokens lexical rather than possessive.  Treating "AI's" as one token
 # can make a repeated product name look like evidence for an unsupported fact.
@@ -38,11 +45,38 @@ AUDIO_UPLOAD_EXTENSIONS = {
 }
 AUDIO_UPLOAD_VIDEO_TYPES = {"video/mp4", "video/webm"}
 DEFAULT_MAX_AUDIO_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
 KOKORO_SAMPLE_RATE = 24_000
 KOKORO_MODEL_REPO = "hexgrad/Kokoro-82M"
 MAX_KOKORO_TEXT_CHARS = 1_200
 MAX_SPOKEN_ANSWER_CHARS = 1_000
 KOKORO_WARMUP_TEXT = "Pitchroom is ready to answer the next presentation question clearly."
+DOCUMENT_EXTENSIONS = {
+    ".docx",
+    ".markdown",
+    ".md",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".txt",
+}
+DOCUMENT_TYPES = {
+    "application/msword",
+    "application/pdf",
+    "application/rtf",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/octet-stream",
+    "text/markdown",
+    "text/plain",
+    "text/x-markdown",
+}
+XML_NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+}
 _kokoro_lock = RLock()
 _kokoro_warmed: set[tuple[str, str, str, float, str]] = set()
 router = APIRouter()
@@ -134,10 +168,266 @@ async def _read_limited_audio_upload(file: UploadFile, max_bytes: int) -> bytes:
     return bytes(audio)
 
 
+@dataclass(frozen=True)
+class SourceSection:
+    """A retrievable source unit with a human-readable page/slide citation."""
+
+    text: str
+    citation: str
+    kind: str = "source"
+
+
+def _normalise_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _sentence_parts(value: str) -> list[str]:
+    """Split prose without throwing away short table/list rows."""
+
+    normalized = _normalise_text(value)
+    if not normalized:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+    return parts or [normalized]
+
+
+def _text_sections(value: str, citation_prefix: str = "Source section") -> list[SourceSection]:
+    sections: list[SourceSection] = []
+    # Blank-line boundaries preserve headings and short list blocks. A single
+    # line document still falls through to sentence-level sections.
+    blocks = [block.strip() for block in re.split(r"(?:\r?\n){2,}", value or "") if block.strip()]
+    if not blocks:
+        blocks = [value or ""]
+    for block in blocks:
+        for part in _sentence_parts(block):
+            sections.append(SourceSection(part, f"{citation_prefix} {len(sections) + 1}"))
+    return sections
+
+
+def _xml_paragraphs(payload: bytes, namespace: str) -> list[str]:
+    """Extract paragraph text from OOXML while keeping table/list rows readable."""
+
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise ValueError("The Office document contains invalid XML.") from exc
+
+    paragraphs: list[str] = []
+    paragraph_tag = f"{{{namespace}}}p"
+    text_tag = f"{{{namespace}}}t"
+    for paragraph in root.iter(paragraph_tag):
+        text = "".join(node.text or "" for node in paragraph.iter(text_tag))
+        text = _normalise_text(text)
+        if text:
+            paragraphs.append(text)
+    return paragraphs
+
+
+def _zip_member(archive: zipfile.ZipFile, name: str) -> bytes:
+    try:
+        return archive.read(name)
+    except KeyError as exc:
+        raise ValueError(f"The Office document is missing {name}.") from exc
+
+
+def _extract_docx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            paragraphs = _xml_paragraphs(_zip_member(archive, "word/document.xml"), XML_NS["w"])
+            image_count = sum(1 for name in archive.namelist() if name.startswith("word/media/"))
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ValueError("This DOCX file could not be opened.") from exc
+
+    sections = [
+        SourceSection(text, f"Document section {index + 1}", "document")
+        for index, text in enumerate(paragraphs)
+    ]
+    warnings: list[str] = []
+    if image_count:
+        warnings.append(f"{image_count} embedded image(s) were not OCR'd; verify image-only claims.")
+    if not sections:
+        warnings.append("No selectable text was found in this DOCX.")
+    return sections, {
+        "format": "docx",
+        "sections": len(sections),
+        "images": image_count,
+        "warnings": warnings,
+    }
+
+
+def _slide_number(name: str) -> int:
+    match = re.search(r"slide(\d+)\.xml$", name)
+    return int(match.group(1)) if match else 0
+
+
+def _extract_pptx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            slide_names = sorted(
+                (name for name in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+                key=_slide_number,
+            )
+            note_names = {
+                _slide_number(name): name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/notesSlides/notesSlide\d+\.xml", name)
+            }
+            media_count = sum(1 for name in archive.namelist() if name.startswith("ppt/media/"))
+            sections: list[SourceSection] = []
+            empty_slides: list[int] = []
+            for name in slide_names:
+                slide_index = _slide_number(name)
+                paragraphs = _xml_paragraphs(_zip_member(archive, name), XML_NS["a"])
+                notes_name = note_names.get(slide_index)
+                notes = _xml_paragraphs(_zip_member(archive, notes_name), XML_NS["a"]) if notes_name else []
+                body = " ".join(paragraphs)
+                if notes:
+                    body = f"{body} Speaker notes: {' '.join(notes)}".strip()
+                body = _normalise_text(body)
+                if body:
+                    sections.append(SourceSection(body, f"Slide {slide_index}", "slide"))
+                else:
+                    empty_slides.append(slide_index)
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ValueError("This PPTX file could not be opened.") from exc
+
+    warnings: list[str] = []
+    if media_count:
+        warnings.append(f"{media_count} embedded image/chart asset(s) were not OCR'd; verify visual claims.")
+    if empty_slides:
+        warnings.append(
+            "No selectable text was found on slide(s) "
+            + ", ".join(str(index) for index in empty_slides)
+            + "; visual-only claims need review."
+        )
+    if not slide_names:
+        raise ValueError("This PPTX contains no presentation slides.")
+    if not sections:
+        warnings.append("No selectable slide text was found in this PPTX.")
+    return sections, {
+        "format": "pptx",
+        "slides": len(slide_names),
+        "sections": len(sections),
+        "images": media_count,
+        "empty_slides": empty_slides,
+        "warnings": warnings,
+    }
+
+
+def _extract_pdf(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
+    try:
+        with pymupdf.open(stream=payload, filetype="pdf") as document:
+            sections: list[SourceSection] = []
+            image_only_pages: list[int] = []
+            for page_number, page in enumerate(document, start=1):
+                text = _normalise_text(page.get_text("text"))
+                if text:
+                    sections.append(SourceSection(text, f"Page {page_number}", "page"))
+                else:
+                    image_only_pages.append(page_number)
+            page_count = len(document)
+    except (pymupdf.FileDataError, ValueError) as exc:
+        raise ValueError("This PDF could not be opened.") from exc
+
+    warnings: list[str] = []
+    if image_only_pages:
+        warnings.append(
+            "No selectable text was found on page(s) "
+            + ", ".join(str(index) for index in image_only_pages)
+            + "; scanned/image-only claims need review."
+        )
+    if not sections:
+        warnings.append("No selectable PDF text was found.")
+    return sections, {
+        "format": "pdf",
+        "pages": page_count,
+        "sections": len(sections),
+        "image_only_pages": image_only_pages,
+        "warnings": warnings,
+    }
+
+
+def _legacy_ppt_to_pptx(payload: bytes, filename: str) -> bytes:
+    """Convert legacy binary .ppt only when LibreOffice is available locally."""
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise ValueError("Legacy .ppt needs LibreOffice; export it as .pptx or PDF and try again.")
+    with tempfile.TemporaryDirectory(prefix="pitchroom-ppt-") as directory:
+        input_path = Path(directory) / (Path(filename or "pitch.ppt").stem + ".ppt")
+        input_path.write_bytes(payload)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pptx", "--outdir", directory, str(input_path)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=45,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("Legacy .ppt conversion failed; export it as .pptx or PDF and try again.") from exc
+        converted = input_path.with_suffix(".pptx")
+        if not converted.exists():
+            raise ValueError("Legacy .ppt conversion produced no readable presentation.")
+        return converted.read_bytes()
+
+
+def _document_upload_limit() -> int:
+    try:
+        configured = int(_setting("MAX_DOCUMENT_BYTES", str(DEFAULT_MAX_DOCUMENT_BYTES)))
+    except ValueError:
+        return DEFAULT_MAX_DOCUMENT_BYTES
+    return configured if configured > 0 else DEFAULT_MAX_DOCUMENT_BYTES
+
+
+async def _read_limited_document_upload(file: UploadFile, max_bytes: int) -> bytes:
+    declared_size = getattr(file, "size", None)
+    if isinstance(declared_size, int) and declared_size > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Pitch files must be at most {max_bytes:,} bytes.")
+    payload = bytearray()
+    while True:
+        chunk_size = min(1024 * 1024, max_bytes - len(payload) + 1)
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Pitch files must be at most {max_bytes:,} bytes.")
+    if not payload:
+        raise HTTPException(status_code=400, detail="Upload a non-empty pitch file.")
+    return bytes(payload)
+
+
+def _extract_document(payload: bytes, filename: str, content_type: str) -> tuple[list[SourceSection], dict[str, Any]]:
+    extension = Path(filename or "").suffix.lower()
+    if extension == ".ppt":
+        payload = _legacy_ppt_to_pptx(payload, filename)
+        extension = ".pptx"
+        content_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    if extension == ".pdf" or content_type == "application/pdf":
+        return _extract_pdf(payload)
+    if extension == ".pptx" or content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+        return _extract_pptx(payload)
+    if extension == ".docx" or content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return _extract_docx(payload)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("This text file is not valid UTF-8.") from exc
+    sections = _text_sections(text)
+    return sections, {
+        "format": "markdown" if extension in {".md", ".markdown"} else "text",
+        "sections": len(sections),
+        "warnings": [],
+    }
+
+
 class DocumentStore:
     def __init__(self, path: Path = DEFAULT_DOCUMENT) -> None:
         self.path = path
         self.text = ""
+        self.sections: list[SourceSection] = []
+        self.metadata: dict[str, Any] = {"format": "text", "sections": 0, "warnings": []}
         # A source label is user-facing.  Keep it readable for a presenter and
         # avoid exposing a server filesystem path in the public live room.
         self.source = path.name or "approved source"
@@ -145,23 +435,51 @@ class DocumentStore:
 
     def load(self) -> str:
         if self.path.exists():
-            self.text = self.path.read_text(encoding="utf-8").strip()
+            raw = self.path.read_text(encoding="utf-8").strip()
+            if raw:
+                self.replace(raw, self.source)
         else:
             self.text = ""
+            self.sections = []
+            self.metadata = {"format": "text", "sections": 0, "warnings": []}
         return self.text
 
-    def replace(self, text: str, source: str = "uploaded document") -> None:
-        normalized = re.sub(r"\s+", " ", text).strip()
+    def replace(
+        self,
+        text: str,
+        source: str = "uploaded document",
+        sections: list[SourceSection] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        prepared_sections = sections or _text_sections(text)
+        prepared_sections = [
+            SourceSection(_normalise_text(section.text), section.citation, section.kind)
+            for section in prepared_sections
+            if _normalise_text(section.text)
+        ]
+        normalized = _normalise_text(" ".join(section.text for section in prepared_sections))
         max_chars = int(_setting("MAX_DOCUMENT_CHARS", "50000"))
         if not normalized:
             raise ValueError("The document must contain text.")
         if len(normalized) > max_chars:
             raise ValueError(f"The document exceeds the {max_chars} character limit.")
         self.text = normalized
-        self.source = source
+        self.sections = prepared_sections
+        self.source = Path(source or "uploaded document").name or "uploaded document"
+        details = dict(metadata or {})
+        details.setdefault("format", "text")
+        details.setdefault("sections", len(prepared_sections))
+        details.setdefault("warnings", [])
+        self.metadata = details
 
     def chunks(self) -> list[str]:
-        return [chunk.strip() for chunk in re.split(r"(?<=[.!?])\s+", self.text) if chunk.strip()]
+        return [section.text for section in self.sections]
+
+    def source_payload(self) -> list[dict[str, str]]:
+        return [
+            {"text": section.text, "citation": section.citation, "kind": section.kind}
+            for section in self.sections
+        ]
 
 
 class QuestionRequest(BaseModel):
@@ -180,7 +498,24 @@ class SpeakRequest(BaseModel):
 store = DocumentStore(_document_path())
 
 
-def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
+def _token_set(value: str) -> set[str]:
+    return {
+        word.lower()
+        for word in WORD_PATTERN.findall(value)
+        if len(word) > 2 and word.lower() not in STOP_WORDS
+    }
+
+
+def _token_stem(word: str) -> str:
+    """Small, dependency-free stemmer for common pitch-language variants."""
+
+    for suffix in ("ingly", "edly", "ing", "ed", "ers", "er", "ies", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)] + ("y" if suffix == "ies" else "")
+    return word
+
+
+def _relevant_sections(question: str, sections: list[SourceSection]) -> list[SourceSection]:
     question_words = {
         word.lower()
         for word in WORD_PATTERN.findall(question)
@@ -189,15 +524,12 @@ def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
     if not question_words:
         return []
 
-    chunk_words = [
-        {word.lower() for word in WORD_PATTERN.findall(chunk) if len(word) > 2}
-        for chunk in chunks
-    ]
+    chunk_words = [_token_set(section.text) for section in sections]
     document_frequency = {
         word: sum(word in words for words in chunk_words)
         for word in question_words
     }
-    common_in_document = max(2, (len(chunks) + 1) // 2)
+    common_in_document = max(2, (len(sections) + 1) // 2)
     distinctive_words = {
         word for word in question_words if document_frequency[word] < common_in_document
     }
@@ -205,10 +537,21 @@ def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
     # only common subject terms. Keep that case answerable, but never let a
     # repeated brand name make an unsupported specific claim appear grounded.
     words = distinctive_words or question_words
-    scored = sorted(
-        ((len(words.intersection(chunk_word_set)), index, chunk) for index, (chunk, chunk_word_set) in enumerate(zip(chunks, chunk_words))),
-        key=lambda item: (-item[0], item[1]),
-    )
+    question_stems = {_token_stem(word) for word in words}
+    question_phrase = " ".join(WORD_PATTERN.findall(question)).lower()
+    scored: list[tuple[float, int, SourceSection]] = []
+    for index, (section, chunk_word_set) in enumerate(zip(sections, chunk_words)):
+        exact = len(words.intersection(chunk_word_set))
+        stem_matches = len(question_stems.intersection({_token_stem(word) for word in chunk_word_set}))
+        phrase_bonus = 0.8 if len(question_phrase) > 8 and question_phrase in section.text.lower() else 0
+        score = exact + stem_matches * 0.35 + phrase_bonus
+        # Decks sometimes include a presenter runbook or judge-script slide.
+        # Keep it searchable, but prefer the product/problem slide when both
+        # contain the same question words.
+        if re.search(r"\b(before presenting|judge demo|use:\s|ask:\s|show:\s)", section.text.lower()):
+            score *= 0.55
+        scored.append((score, index, section))
+    scored.sort(key=lambda item: (-item[0], item[1]))
     if not scored or scored[0][0] <= 0:
         return []
 
@@ -216,8 +559,19 @@ def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
     # focused on the strongest evidence instead of stitching together every
     # loosely related sentence that shares one generic word.
     top_score = scored[0][0]
-    minimum_score = max(1, (top_score * 3 + 4) // 5)  # ceiling(top_score * 0.6)
-    return [chunk for score, _, chunk in scored[:4] if score >= minimum_score]
+    # A pure morphology match (for example "accept" → "accepting") is still
+    # useful when a short question has no exact keyword overlap. Keep the
+    # floor below that lightweight score rather than dropping every low-signal
+    # but valid source section.
+    minimum_score = max(0.25, top_score * 0.6)
+    return [section for score, _, section in scored[:4] if score >= minimum_score]
+
+
+def _relevant_chunks(question: str, chunks: list[str]) -> list[str]:
+    """Backward-compatible text-only retrieval helper used by older callers."""
+
+    sections = [SourceSection(chunk, f"Source section {index + 1}") for index, chunk in enumerate(chunks)]
+    return [section.text for section in _relevant_sections(question, sections)]
 
 
 def _huggingface_request(model: str, payload: bytes, content_type: str) -> bytes:
@@ -728,6 +1082,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "document_loaded": bool(store.text),
         "document_source": store.source,
+        "document_metadata": store.metadata,
         "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
         "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
         "kokoro_selected": _tts_provider_preference() == "kokoro",
@@ -741,7 +1096,13 @@ def health() -> dict[str, Any]:
 def get_pitch() -> dict[str, Any]:
     if not store.text:
         raise HTTPException(status_code=404, detail="No pitch document has been loaded.")
-    return {"source": store.source, "text": store.text, "chunks": store.chunks()}
+    return {
+        "source": store.source,
+        "text": store.text,
+        "chunks": store.chunks(),
+        "sections": store.source_payload(),
+        "metadata": store.metadata,
+    }
 
 
 @router.post("/api/pitch/demo")
@@ -754,48 +1115,62 @@ def load_demo_pitch() -> dict[str, Any]:
     try:
         text = DEFAULT_DOCUMENT.read_text(encoding="utf-8")
         store.path = DEFAULT_DOCUMENT
-        store.replace(text, DEFAULT_DOCUMENT.name)
+        store.replace(text, DEFAULT_DOCUMENT.name, metadata={"format": "text", "demo": True})
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=500, detail="The included demo source could not be loaded.") from exc
-    return {"source": store.source, "characters": len(store.text), "chunks": len(store.chunks())}
+    return {
+        "source": store.source,
+        "characters": len(store.text),
+        "chunks": len(store.chunks()),
+        "metadata": store.metadata,
+    }
 
 
 @router.post("/api/pitch/document")
 def upload_document(request: DocumentRequest) -> dict[str, Any]:
     try:
-        store.replace(request.document, "request body")
+        store.replace(request.document, "request body", metadata={"format": "text"})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"source": store.source, "characters": len(store.text), "chunks": len(store.chunks())}
+    return {
+        "source": store.source,
+        "characters": len(store.text),
+        "chunks": len(store.chunks()),
+        "metadata": store.metadata,
+    }
 
 
 @router.post("/api/pitch/file")
 async def upload_pitch_file(file: UploadFile = File(...)) -> dict[str, Any]:
-    content_type = (file.content_type or "").lower()
-    filename = (file.filename or "").lower()
-    accepted_types = {"text/plain", "text/markdown", "text/x-markdown", "application/octet-stream", "application/pdf"}
-    is_pdf = content_type == "application/pdf" or filename.endswith(".pdf")
-    is_text = content_type in accepted_types - {"application/pdf"} or filename.endswith((".txt", ".md", ".markdown"))
-    if not is_pdf and not is_text:
-        raise HTTPException(status_code=415, detail="Upload a PDF, plain-text, or Markdown document.")
-    raw = await file.read()
+    content_type = (file.content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    filename = file.filename or "uploaded document"
+    extension = Path(filename).suffix.lower()
+    if extension not in DOCUMENT_EXTENSIONS and content_type not in DOCUMENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Upload a PPTX, PDF, DOCX, plain-text, or Markdown pitch file. Legacy .ppt files need LibreOffice.",
+        )
+    raw = await _read_limited_document_upload(file, _document_upload_limit())
     try:
-        if is_pdf:
-            with pymupdf.open(stream=raw, filetype="pdf") as document:
-                text = "\n".join(page.get_text("text") for page in document)
-        else:
-            text = raw.decode("utf-8")
-        store.replace(text, file.filename or "uploaded document")
-    except (UnicodeDecodeError, ValueError, pymupdf.FileDataError) as exc:
+        sections, metadata = _extract_document(raw, filename, content_type)
+        text = "\n\n".join(section.text for section in sections)
+        store.replace(text, filename, sections=sections, metadata=metadata)
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"source": store.source, "characters": len(store.text), "chunks": len(store.chunks())}
+    return {
+        "source": store.source,
+        "characters": len(store.text),
+        "chunks": len(store.chunks()),
+        "metadata": store.metadata,
+    }
 
 
 @router.post("/api/voice/answer")
 def answer_question(request: QuestionRequest) -> dict[str, Any]:
     if not store.text:
         raise HTTPException(status_code=404, detail="No pitch document has been loaded.")
-    context = _relevant_chunks(request.question, store.chunks())
+    context_sections = _relevant_sections(request.question, store.sections)
+    context = [section.text for section in context_sections]
     answer = _fallback_answer(context)
     provider = "extractive"
     if context and _answer_generation_provider() == "huggingface":
@@ -806,7 +1181,17 @@ def answer_question(request: QuestionRequest) -> dict[str, Any]:
             # to make a source-grounded answer unavailable during a live demo.
             pass
     answer = _bounded_spoken_answer(answer)
-    return {"question": request.question, "answer": answer, "grounded": bool(context), "provider": provider, "sources": context}
+    return {
+        "question": request.question,
+        "answer": answer,
+        "grounded": bool(context),
+        "provider": provider,
+        "sources": context,
+        "source_refs": [
+            {"citation": section.citation, "kind": section.kind, "text": section.text}
+            for section in context_sections
+        ],
+    }
 
 
 @router.post("/api/voice/transcribe")

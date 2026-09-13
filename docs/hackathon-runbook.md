@@ -14,15 +14,14 @@ Pitchroom AI serves founders preparing for investor meetings, customer conversat
 
 Say:
 
-- “Pitchroom loads a text-based source, listens after one start tap, and automatically sends a question after the speaker pauses.”
+- “Pitchroom loads a pitch deck or document, keeps slide/page citations attached, listens after one start tap, and automatically sends a question after the speaker pauses.”
 - “You can inspect the exact source sections that supported the answer.”
 - “The refusal path is intentional. When Pitchroom finds no matching approved-source evidence, it says so.”
 - “The current prototype provides seamless turn-taking, not streaming word-by-word transcription.”
 
 Do not say:
 
-- “It understands every PowerPoint slide, chart, or scanned PDF.”
-- “It is hallucination-proof.”
+- “It understands every chart, screenshot, or scanned slide automatically.”
 - “It has multi-user storage, authentication, or production privacy controls.”
 - “It provides real-time streaming conversation.”
 
@@ -38,7 +37,7 @@ Do not say:
 
 ### 0:40–1:40 — Live proof
 
-1. Point to `pitch.txt` and say: “This is the approved source for the conversation.”
+1. Upload the real `.pptx` (or use `pitch.txt`) and say: “This is the approved source for the conversation.” Point out the slide count and any extraction warning before starting.
 2. Select **Start live session** once and grant microphone permission.
 3. Ask: “What problem does Pitchroom AI solve?” then stop speaking normally.
 4. Point out that no record-stop action is needed: the pause sent the turn.
@@ -56,7 +55,7 @@ Close with: “Pitchroom AI helps a founder enter the room prepared, consistent,
 
 ## 30-second version
 
-“Pitchroom AI turns an approved pitch into a source-grounded voice conversation. Upload a text-based source, ask a question aloud, see the answer’s evidence, and hear the reply. If the deck does not support a claim, Pitchroom says so. Every answer, from the deck.”
+“Pitchroom AI turns an approved pitch into a source-grounded voice conversation. Upload a deck or document, ask a question aloud, see the slide/page evidence, and hear the reply. If the source does not support a claim, Pitchroom says so. Every answer, from the deck.”
 
 ## Stage preflight
 
@@ -83,11 +82,11 @@ Use the included demo brief only for practice. Before using an actual company pi
 | Kokoro is still loading | Use the free browser voice for that run, or wait for the first local warm-up before beginning the judged demo. |
 | A provider is slow | Use the three scripted text questions, then show the source sections. |
 | The question gets no match | Treat it as the trust moment. Say the source does not support the claim. |
-| A real deck has image-only slides | Use a short text-based demo brief with the key facts written as clear sentences. |
+| A real deck has image-only slides | Use the extraction warning as a trust moment, then keep a text-selectable PDF or short demo brief with the key facts written as clear sentences. |
 
 ## Next product steps
 
 1. Add per-workspace storage and versioned sources.
-2. Return slide and page citations instead of sentence-only citations.
-3. Support OCR, `.pptx`, charts, and image-based slides.
+2. Add OCR/vision extraction for image-only slides, charts, and scanned PDFs, with human-review flags.
+3. Add per-answer confidence/calibration and a review queue for weak retrieval matches.
 4. Add live streaming voice after the reliable recorded-turn workflow is proven.

@@ -32,6 +32,7 @@ const elements = {
   evidenceList: document.querySelector("#evidence-list"),
   sourceNameTop: document.querySelector("#source-name-top"),
   sourceMeta: document.querySelector("#source-meta"),
+  sourceIngestStatus: document.querySelector("#source-ingest-status"),
   sourceExcerpt: document.querySelector("#source-excerpt"),
   sourceUpload: document.querySelector("#source-upload"),
   demoReset: document.querySelector("#demo-reset"),
@@ -210,13 +211,21 @@ function renderAnswer(answerData) {
   elements.groundingBadge.textContent = grounded ? "Grounded in source" : "No matching source";
   elements.groundingBadge.className = `grounding-badge ${grounded ? "is-grounded" : "is-ungrounded"}`;
   const sources = Array.isArray(answerData.sources) ? answerData.sources : [];
+  const sourceRefs = Array.isArray(answerData.source_refs) ? answerData.source_refs : [];
   if (sources.length) {
     elements.evidenceStatus.textContent = `${sources.length} source section${sources.length === 1 ? "" : "s"} used for this response.`;
     elements.evidenceList.innerHTML = "";
-    sources.forEach((source) => {
+    sources.forEach((source, index) => {
       const quote = document.createElement("blockquote");
       quote.className = "evidence-quote";
-      quote.textContent = source;
+      const citation = sourceRefs[index]?.citation;
+      if (citation) {
+        const citationLabel = document.createElement("span");
+        citationLabel.className = "evidence-citation";
+        citationLabel.textContent = citation;
+        quote.append(citationLabel);
+      }
+      quote.append(document.createTextNode(source));
       elements.evidenceList.append(quote);
     });
   } else {
@@ -239,8 +248,22 @@ async function loadPitch() {
   elements.sourceNameTop.title = source;
   const chunks = Array.isArray(pitch.chunks) ? pitch.chunks.length : 0;
   const characters = (pitch.text || "").length;
-  elements.sourceMeta.textContent = `${source} · ${chunks} source sections · ${characters.toLocaleString()} characters`;
-  elements.sourceExcerpt.textContent = pitch.text || "No approved source is loaded.";
+  const metadata = pitch.metadata && typeof pitch.metadata === "object" ? pitch.metadata : {};
+  const format = String(metadata.format || "text").toUpperCase();
+  const units = metadata.slides ? `${metadata.slides} slides` : metadata.pages ? `${metadata.pages} pages` : `${chunks} source sections`;
+  elements.sourceMeta.textContent = `${source} · ${format} · ${units} · ${characters.toLocaleString()} characters`;
+  const warnings = Array.isArray(metadata.warnings) ? metadata.warnings.filter(Boolean) : [];
+  if (elements.sourceIngestStatus) {
+    elements.sourceIngestStatus.dataset.state = warnings.length ? "warning" : "ready";
+    elements.sourceIngestStatus.title = warnings.join("\n");
+    elements.sourceIngestStatus.textContent = warnings.length
+      ? `Review before presenting: ${warnings[0]}`
+      : `${format} source ready. Slide/page citations will stay attached to grounded answers.`;
+  }
+  const sections = Array.isArray(pitch.sections) ? pitch.sections : [];
+  elements.sourceExcerpt.textContent = sections.length
+    ? sections.map((section) => `${section.citation || "Source section"}\n${section.text || ""}`).join("\n\n")
+    : (pitch.text || "No approved source is loaded.");
   return pitch;
 }
 
