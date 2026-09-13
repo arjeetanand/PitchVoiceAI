@@ -6,10 +6,13 @@ import base64
 import binascii
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 import wave
+from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import pymupdf
@@ -33,6 +36,13 @@ AUDIO_UPLOAD_EXTENSIONS = {
 }
 AUDIO_UPLOAD_VIDEO_TYPES = {"video/mp4", "video/webm"}
 DEFAULT_MAX_AUDIO_BYTES = 10 * 1024 * 1024
+KOKORO_SAMPLE_RATE = 24_000
+KOKORO_MODEL_REPO = "hexgrad/Kokoro-82M"
+MAX_KOKORO_TEXT_CHARS = 1_200
+MAX_SPOKEN_ANSWER_CHARS = 1_000
+KOKORO_WARMUP_TEXT = "Pitchroom is ready to answer the next presentation question clearly."
+_kokoro_lock = RLock()
+_kokoro_warmed: set[tuple[str, str, str, float, str]] = set()
 router = APIRouter()
 
 
@@ -68,10 +78,12 @@ def _tts_provider_preference() -> str:
         "web": "browser",
         "browser-native": "browser",
         "local-piper": "piper",
+        "local-kokoro": "kokoro",
+        "studio": "kokoro",
         "hf": "huggingface",
     }
     configured = aliases.get(configured, configured)
-    return configured if configured in {"auto", "browser", "piper", "sarvam", "huggingface", "openai"} else "auto"
+    return configured if configured in {"auto", "browser", "kokoro", "piper", "sarvam", "huggingface", "openai"} else "auto"
 
 
 def _audio_upload_limit() -> int:
@@ -282,6 +294,34 @@ def _fallback_answer(context: list[str]) -> str:
     return "According to the pitch document: " + " ".join(context)
 
 
+def _bounded_spoken_answer(answer: str) -> str:
+    """Keep a live answer natural and inside the local studio-voice budget."""
+    normalized = re.sub(r"\s+", " ", answer).strip()
+    if len(normalized) <= MAX_SPOKEN_ANSWER_CHARS:
+        return normalized
+
+    complete_sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+        if sentence.strip()
+    ]
+    selected: list[str] = []
+    selected_length = 0
+    for sentence in complete_sentences:
+        candidate_length = selected_length + len(sentence) + (1 if selected else 0)
+        if candidate_length > MAX_SPOKEN_ANSWER_CHARS:
+            break
+        selected.append(sentence)
+        selected_length = candidate_length
+    if selected:
+        return " ".join(selected)
+
+    # Avoid cutting a very long source sentence halfway through a claim. The
+    # evidence remains visible in the UI, and a focused follow-up can select a
+    # shorter source passage for the local presenter voice.
+    return "The matching source passage is too long to read aloud in one reply. Please ask a more focused question."
+
+
 def _openai_audio(text: str, voice: str) -> bytes:
     url = _setting("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/audio/speech"
     request = urllib.request.Request(
@@ -331,6 +371,158 @@ def _piper_audio(text: str, voice: str | None = None) -> bytes:
     if not audio:
         raise RuntimeError("Piper returned no audio.")
     return audio
+
+
+def _kokoro_speed() -> float:
+    """Return a deliberately conversational speed for the studio voice."""
+    try:
+        speed = float(_setting("KOKORO_SPEED", "0.98"))
+    except ValueError as exc:
+        raise RuntimeError("KOKORO_SPEED must be a number between 0.8 and 1.2.") from exc
+    if not 0.8 <= speed <= 1.2:
+        raise RuntimeError("KOKORO_SPEED must be between 0.8 and 1.2.")
+    return speed
+
+
+def _kokoro_device() -> str:
+    """Choose the fastest safe local device without making it a requirement."""
+    configured = _setting("KOKORO_DEVICE", "auto").lower()
+    if configured in {"cpu", "cuda", "mps"}:
+        if configured == "mps":
+            # Kokoro requires this PyTorch fallback flag for its MPS path. It
+            # lets unsupported operations fall back to CPU rather than making
+            # the live demo fail on an Apple Silicon laptop.
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        return configured
+    if configured != "auto":
+        raise RuntimeError("KOKORO_DEVICE must be auto, cpu, cuda, or mps.")
+
+    # PyTorch reads this compatibility flag while its MPS backend is imported.
+    # Set it before importing torch, otherwise Kokoro can fail mid-synthesis on
+    # an unsupported Apple-Silicon operator such as `aten::angle`.
+    if sys.platform == "darwin":
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+    try:
+        import torch
+    except (ImportError, OSError):
+        # The later Kokoro import produces the actionable installation error.
+        return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps and mps.is_available():
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        return "mps"
+    return "cpu"
+
+
+def _kokoro_options() -> tuple[str, str, str, float, str]:
+    """Return the fully resolved, allowlisted local studio-voice settings."""
+    return (
+        _setting("KOKORO_LANG_CODE", "a").lower(),
+        _setting("KOKORO_VOICE", "af_heart"),
+        KOKORO_MODEL_REPO,
+        _kokoro_speed(),
+        _kokoro_device(),
+    )
+
+
+@lru_cache(maxsize=4)
+def _kokoro_pipeline(lang_code: str, model_repo: str, device: str) -> Any:
+    """Load the official Kokoro model once per configured local device."""
+    try:
+        from kokoro import KPipeline
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "Kokoro local voice is unavailable. Install backend/requirements-kokoro.txt, "
+            "then restart the app."
+        ) from exc
+
+    try:
+        return KPipeline(lang_code=lang_code, repo_id=model_repo, device=device)
+    except Exception as exc:
+        raise RuntimeError(
+            "Kokoro could not load its local English voice. Check the model download, "
+            "KOKORO_DEVICE, and the optional espeak-ng install."
+        ) from exc
+
+
+def _kokoro_audio(text: str) -> bytes:
+    """Synthesize a cached, local 24 kHz Kokoro WAV for a short live answer."""
+    if len(text) > MAX_KOKORO_TEXT_CHARS:
+        raise RuntimeError(
+            f"Kokoro is optimized for live replies up to {MAX_KOKORO_TEXT_CHARS:,} characters. "
+            "Ask a more focused question or use the browser voice for a full-document read."
+        )
+    return _kokoro_audio_with_options(text, _kokoro_options())
+
+
+def _kokoro_audio_with_options(
+    text: str,
+    options: tuple[str, str, str, float, str],
+) -> bytes:
+    """Generate PCM with already-resolved local studio-voice settings."""
+    lang_code, voice, model_repo, speed, device = options
+
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("Kokoro local voice needs NumPy. Reinstall backend requirements.") from exc
+
+    try:
+        with _kokoro_lock:
+            pipeline = _kokoro_pipeline(lang_code, model_repo, device)
+            parts: list[Any] = []
+            # Let Kokoro's English tokenizer keep a short answer in one
+            # contextual phrase. It already splits at safe phoneme boundaries;
+            # manually resetting on every sentence makes narration less fluid.
+            for _, _, generated in pipeline(
+                text,
+                voice=voice,
+                speed=speed,
+                split_pattern=None,
+            ):
+                if generated is None:
+                    continue
+                if hasattr(generated, "detach"):
+                    generated = generated.detach()
+                if hasattr(generated, "cpu"):
+                    generated = generated.cpu()
+                samples = np.asarray(generated, dtype=np.float32).reshape(-1)
+                if samples.size:
+                    parts.append(samples)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "Kokoro local voice could not synthesize this answer. Check the selected voice and pronunciation setup."
+        ) from exc
+
+    if not parts:
+        raise RuntimeError("Kokoro local voice returned no audio.")
+
+    audio = np.concatenate(parts)
+    pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2", copy=False)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(KOKORO_SAMPLE_RATE)
+        wav_file.writeframes(pcm.tobytes())
+    return output.getvalue()
+
+
+def _warm_kokoro_voice() -> bool:
+    """Warm each model/voice/device configuration once per server process."""
+    options = _kokoro_options()
+    with _kokoro_lock:
+        if options in _kokoro_warmed:
+            return False
+        _kokoro_audio_with_options(KOKORO_WARMUP_TEXT, options)
+        _kokoro_warmed.add(options)
+    return True
 
 
 def _sarvam_audio(text: str) -> bytes:
@@ -460,6 +652,10 @@ def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
     preference = _tts_provider_preference()
     if preference == "browser":
         raise RuntimeError("Browser voice is selected; the browser will synthesize this answer locally.")
+    if preference == "kokoro":
+        # Keep the studio voice deterministic and curated through KOKORO_VOICE
+        # rather than accepting arbitrary model/voice downloads from requests.
+        return _kokoro_audio(text), "audio/wav"
     if preference == "piper":
         return _piper_audio(text, voice), "audio/wav"
 
@@ -500,7 +696,8 @@ def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
         raise RuntimeError("All configured text-to-speech providers failed: " + "; ".join(errors))
 
     raise RuntimeError(
-        "No server speech provider is configured. Set PIPER_TTS_URL for free local Piper, or configure a hosted provider."
+        "No server speech provider is configured. Set TTS_PROVIDER=kokoro for the local studio voice, "
+        "set PIPER_TTS_URL for local Piper, or configure a hosted provider."
     )
 
 
@@ -508,6 +705,8 @@ def _speech_provider() -> str:
     preference = _tts_provider_preference()
     if preference == "browser":
         return "browser"
+    if preference == "kokoro":
+        return "kokoro"
     if preference == "piper":
         return "piper" if _setting("PIPER_TTS_URL", "") else "piper-unconfigured"
     if _setting("SARVAM_API_KEY", ""):
@@ -533,6 +732,7 @@ def health() -> dict[str, Any]:
         "document_source": store.source,
         "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
         "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
+        "kokoro_selected": _tts_provider_preference() == "kokoro",
         "piper_configured": bool(_setting("PIPER_TTS_URL", "")),
         "openai_configured": bool(_setting("OPENAI_API_KEY", "")),
         "speech_provider": _speech_provider(),
@@ -607,6 +807,7 @@ def answer_question(request: QuestionRequest) -> dict[str, Any]:
             # A configured generation provider is an enhancement, not a reason
             # to make a source-grounded answer unavailable during a live demo.
             pass
+    answer = _bounded_spoken_answer(answer)
     return {"question": request.question, "answer": answer, "grounded": bool(context), "provider": provider, "sources": context}
 
 
@@ -634,6 +835,24 @@ def speak(request: SpeakRequest) -> Response:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return Response(content=audio, media_type=media_type)
+
+
+@router.post("/api/voice/warm")
+def warm_voice() -> dict[str, Any]:
+    """Warm only the explicitly selected local studio voice.
+
+    The page calls this harmlessly during load, giving Kokoro time to load while
+    a presenter grants microphone access or starts their first question. Remote
+    providers are deliberately never invoked by this endpoint.
+    """
+    preference = _tts_provider_preference()
+    if preference != "kokoro":
+        return {"provider": _speech_provider(), "warmed": False, "ready": preference == "browser"}
+    try:
+        warmed = _warm_kokoro_voice()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"provider": "kokoro", "warmed": warmed, "ready": True}
 
 
 @router.post("/api/pitch/read")

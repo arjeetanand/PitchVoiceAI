@@ -5,6 +5,7 @@ import wave
 
 from pathlib import Path
 
+import numpy as np
 import pymupdf
 from fastapi.testclient import TestClient
 
@@ -51,6 +52,20 @@ def test_answer_declines_unknown_question() -> None:
     assert response.status_code == 200
     assert response.json()["grounded"] is False
     assert "could not find" in response.json()["answer"]
+
+
+def test_answer_stays_within_the_live_studio_voice_budget(monkeypatch) -> None:
+    monkeypatch.setenv("ANSWER_GENERATION_PROVIDER", "extractive")
+    long_source_sentence = "Pitchroom evidence supports founders " + ("with documented details " * 30) + "."
+    client.post("/api/pitch/document", json={"document": " ".join([long_source_sentence] * 4)})
+
+    response = client.post("/api/voice/answer", json={"question": "What Pitchroom evidence supports founders?"})
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert len(answer) <= pitch_routes.MAX_SPOKEN_ANSWER_CHARS
+    assert answer.endswith(".")
+    assert "Pitchroom evidence supports founders" in answer
 
 
 def test_answer_declines_unknown_fact_when_the_subject_name_repeats() -> None:
@@ -253,6 +268,132 @@ def test_piper_speech_response_uses_local_http_service(monkeypatch) -> None:
     assert response.content.startswith(b"RIFF")
     assert captured["url"] == "http://127.0.0.1:5000/synthesize"
     assert captured["payload"] == {"text": "Read this pitch."}
+
+
+def test_kokoro_speech_response_uses_the_local_studio_voice(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+    monkeypatch.setattr(pitch_routes, "_kokoro_audio", lambda text: _wav_bytes())
+
+    response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/wav")
+    assert response.content.startswith(b"RIFF")
+
+
+def test_kokoro_converts_configured_pipeline_output_to_24khz_wav(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __call__(self, text, voice, speed, split_pattern):
+            captured.update({"text": text, "voice": voice, "speed": speed, "split_pattern": split_pattern})
+            yield "Pitchroom is ready.", "phonemes", np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+
+    monkeypatch.setattr(pitch_routes, "_kokoro_pipeline", lambda *args: FakePipeline())
+    audio = pitch_routes._kokoro_audio_with_options(
+        "Pitchroom is ready.",
+        ("a", "af_heart", pitch_routes.KOKORO_MODEL_REPO, 0.98, "cpu"),
+    )
+
+    with wave.open(io.BytesIO(audio), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 24_000
+        assert wav_file.getnframes() == 3
+    assert captured == {
+        "text": "Pitchroom is ready.",
+        "voice": "af_heart",
+        "speed": 0.98,
+        "split_pattern": None,
+    }
+
+
+def test_kokoro_refuses_oversized_live_speech_before_loading_a_model(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+    loader_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(pitch_routes, "_kokoro_pipeline", lambda *args: loader_calls.append(args))
+
+    response = client.post("/api/voice/speak", json={"text": "x" * (pitch_routes.MAX_KOKORO_TEXT_CHARS + 1)})
+
+    assert response.status_code == 503
+    assert "optimized for live replies" in response.json()["detail"]
+    assert loader_calls == []
+
+
+def test_kokoro_limits_a_long_pitch_read_before_it_can_block_live_answers(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+    client.post("/api/pitch/document", json={"document": "x" * (pitch_routes.MAX_KOKORO_TEXT_CHARS + 1)})
+
+    response = client.post("/api/pitch/read")
+
+    assert response.status_code == 503
+    assert "optimized for live replies" in response.json()["detail"]
+
+
+def test_kokoro_failure_does_not_fall_through_to_hosted_tts(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_kokoro_audio",
+        lambda text: (_ for _ in ()).throw(RuntimeError("Kokoro model is warming")),
+    )
+    monkeypatch.setattr(
+        pitch_routes,
+        "_sarvam_audio",
+        lambda text: (_ for _ in ()).throw(AssertionError("Sarvam must not be called")),
+    )
+    monkeypatch.setattr(
+        pitch_routes,
+        "_openai_audio",
+        lambda text, voice: (_ for _ in ()).throw(AssertionError("OpenAI must not be called")),
+    )
+
+    response = client.post("/api/voice/speak", json={"text": "Read this pitch."})
+
+    assert response.status_code == 503
+    assert "Kokoro model is warming" in response.json()["detail"]
+
+
+def test_kokoro_warm_route_preloads_only_the_selected_local_voice(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+    warmed: list[bool] = []
+    monkeypatch.setattr(pitch_routes, "_warm_kokoro_voice", lambda: warmed.append(True) or True)
+
+    response = client.post("/api/voice/warm")
+
+    assert response.status_code == 200
+    assert response.json() == {"provider": "kokoro", "warmed": True, "ready": True}
+    assert warmed == [True]
+
+
+def test_kokoro_warmup_synthesizes_once_per_resolved_configuration(monkeypatch) -> None:
+    options = ("a", "af_heart", pitch_routes.KOKORO_MODEL_REPO, 0.98, "cpu")
+    calls: list[tuple[str, tuple[str, str, str, float, str]]] = []
+    pitch_routes._kokoro_warmed.clear()
+    monkeypatch.setattr(pitch_routes, "_kokoro_options", lambda: options)
+    monkeypatch.setattr(
+        pitch_routes,
+        "_kokoro_audio_with_options",
+        lambda text, configured_options: calls.append((text, configured_options)) or _wav_bytes(),
+    )
+
+    assert pitch_routes._warm_kokoro_voice() is True
+    assert pitch_routes._warm_kokoro_voice() is False
+
+    assert calls == [(pitch_routes.KOKORO_WARMUP_TEXT, options)]
+    pitch_routes._kokoro_warmed.clear()
+
+
+def test_health_identifies_an_explicit_kokoro_selection(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "kokoro")
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["speech_provider"] == "kokoro"
+    assert response.json()["kokoro_selected"] is True
 
 
 def test_sarvam_failure_falls_back_to_openai(monkeypatch) -> None:

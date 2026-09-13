@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional local studio voice. Keep it separate so the browser-voice Render
+# deployment stays lean; install this file for a local Kokoro presentation.
+kokoro==0.9.4

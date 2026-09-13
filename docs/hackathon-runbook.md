@@ -43,7 +43,7 @@ Do not say:
 3. Ask: “What problem does Pitchroom AI solve?” then stop speaking normally.
 4. Point out that no record-stop action is needed: the pause sent the turn.
 5. Point to **Heard**, the grounded answer, and **Source evidence**.
-6. Let the spoken reply end and call out that the room is listening again. If Sarvam is not configured, say that the answer is being spoken by the free browser voice.
+6. Let the spoken reply end and call out that the room is listening again. With `TTS_PROVIDER=kokoro`, say that the answer is being spoken by the local studio voice; otherwise it uses the free browser voice.
 7. For a memorable live moment, speak over the reply with: “And what happens if there is no evidence?” Point out that the reply stops and the new question is captured without a second microphone click.
 
 ### 1:40–2:00 — Trust moment and close
@@ -66,10 +66,11 @@ Run this 10 minutes before judging:
 2. Select **Use demo brief** to reset the pitch.
 3. Ask the first demo question by text and verify source evidence appears.
 4. Start one live session in the browser you will present from.
-5. Ask one short question, pause, and confirm the transcript, answer, source evidence, and spoken reply appear.
-6. Confirm that listening resumes after the spoken reply.
-7. Speak over a reply once and confirm the reply stops and the next question is captured.
-7. Keep the text-demo questions ready as a fallback.
+5. If using Kokoro, open the room one minute early so its one-time local model load finishes; ask one short text question, then select **Play answer** to confirm the warm studio voice is ready.
+6. Ask one short question, pause, and confirm the transcript, answer, source evidence, and spoken reply appear.
+7. Confirm that listening resumes after the spoken reply.
+8. Speak over a reply once and confirm the reply stops and the next question is captured.
+9. Keep the text-demo questions ready as a fallback.
 
 Use the included demo brief only for practice. Before using an actual company pitch, confirm that the configured transcription and speech providers may receive its content and recorded audio.
 
@@ -79,6 +80,7 @@ Use the included demo brief only for practice. Before using an actual company pi
 | --- | --- |
 | Microphone permission fails | Use a demo question by text and explain that the transcript plus answer path is identical after speech-to-text. |
 | Venue audio is unreliable | Use headphones, choose `TTS_PROVIDER=browser`, or use **Play answer** if the browser permits it, then continue with the visible transcript and source evidence. |
+| Kokoro is still loading | Use the free browser voice for that run, or wait for the first local warm-up before beginning the judged demo. |
 | A provider is slow | Use the three scripted text questions, then show the source sections. |
 | The question gets no match | Treat it as the trust moment. Say the source does not support the claim. |
 | A real deck has image-only slides | Use a short text-based demo brief with the key facts written as clear sentences. |

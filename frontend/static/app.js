@@ -8,6 +8,7 @@ const BARGE_IN_CONFIRMATION_MS = 280;
 const BARGE_IN_GRACE_MS = 360;
 const BARGE_IN_MIN_THRESHOLD = 0.018;
 const BARGE_IN_THRESHOLD_MULTIPLIER = 1.45;
+const BARGE_PREARM_MAX_MS = 4000;
 const MAX_TURN_MS = 25000;
 const CALIBRATION_MS = 850;
 const MIN_VOICE_THRESHOLD = 0.012;
@@ -23,6 +24,7 @@ const elements = {
   stageToggle: document.querySelector("#live-toggle-stage"),
   stageToggleLabel: document.querySelector("#live-toggle-stage-label"),
   liveHint: document.querySelector("#live-hint"),
+  voiceReadiness: document.querySelector("#voice-readiness"),
   liveAnnouncement: document.querySelector("#live-announcement"),
   voiceError: document.querySelector("#voice-error"),
   heard: document.querySelector("#heard-question"),
@@ -73,9 +75,11 @@ const state = {
   browserSpeechCancel: null,
   speakingStartedAt: 0,
   bargeCandidateAt: 0,
+  bargeInArmed: false,
   turnEpoch: 0,
   lastAnswer: "",
   pendingAbort: null,
+  speechWarmPromise: null,
 };
 
 const phaseCopy = {
@@ -282,7 +286,9 @@ function clearAudio() {
   state.currentAudio = null;
   state.currentAudioUrl = null;
   state.speakingStartedAt = 0;
-  state.bargeCandidateAt = 0;
+  // A recorder can be collecting an interruption while the server finishes
+  // the WAV. Preserve its candidate state as the audio element is attached.
+  if (!state.bargeInArmed) state.bargeCandidateAt = 0;
   if (audio) {
     audio.pause();
     audio.removeAttribute("src");
@@ -315,6 +321,7 @@ function startRecorder(mode = "live") {
     mode,
     accepted: mode !== "barge",
     chunks: [],
+    preArmTimer: 0,
     recorder,
     sessionId: state.sessionId,
     turnEpoch: 0,
@@ -325,6 +332,10 @@ function startRecorder(mode = "live") {
     if (event.data && event.data.size) capture.chunks.push(event.data);
   });
   recorder.addEventListener("stop", () => {
+    if (capture.preArmTimer) {
+      window.clearTimeout(capture.preArmTimer);
+      capture.preArmTimer = 0;
+    }
     const blob = new Blob(capture.chunks, { type: recorder.mimeType || "audio/webm" });
     if (state.recorder === recorder) state.recorder = null;
     if (state.recorderContext === capture) state.recorderContext = null;
@@ -339,9 +350,39 @@ function startRecorder(mode = "live") {
       const turnEpoch = capture.turnEpoch || ++state.turnEpoch;
       capture.turnEpoch = turnEpoch;
       processVoiceTurn(blob, capture.sessionId, turnEpoch);
+    } else if (
+      capture.mode === "barge"
+      && !capture.accepted
+      && state.active
+      && state.bargeInArmed
+      && !state.bargeCandidateAt
+    ) {
+      // Keep the pre-answer capture bounded without dropping WebM headers.
+      // A new recorder starts a fresh valid short pre-roll if speech still has
+      // not begun after this one is discarded.
+      window.setTimeout(() => {
+        if (state.active && state.bargeInArmed && !state.bargeCandidateAt && !state.recorder) {
+          armBargeCapture();
+        }
+      }, 40);
     }
   });
   recorder.start(120);
+  if (mode === "barge") {
+    capture.preArmTimer = window.setTimeout(() => {
+      if (
+        !capture.accepted
+        && state.recorderContext === capture
+        && recorder.state !== "inactive"
+      ) {
+        // Do not let an incomplete candidate keep a buffered WebM recorder
+        // alive indefinitely in a throttled tab. The stop handler starts a
+        // fresh, valid short pre-roll when the room is still armed.
+        state.bargeCandidateAt = 0;
+        recorder.stop();
+      }
+    }, BARGE_PREARM_MAX_MS);
+  }
   return true;
 }
 
@@ -359,7 +400,29 @@ function discardBargeCapture() {
   if (capture.recorder.state !== "inactive") capture.recorder.stop();
 }
 
+function armBargeCapture() {
+  if (!state.active || !state.stream) return false;
+  const capture = state.recorderContext;
+  const hasPreArmedCapture = capture?.mode === "barge" && capture.recorder.state !== "inactive";
+  if (hasPreArmedCapture) {
+    state.bargeInArmed = true;
+    return true;
+  }
+  state.bargeInArmed = true;
+  state.bargeCandidateAt = 0;
+  if (startRecorder("barge")) return true;
+  state.bargeInArmed = false;
+  return false;
+}
+
+function disarmBargeCapture() {
+  state.bargeInArmed = false;
+  discardBargeCapture();
+}
+
 async function pauseCaptureForPlayback() {
+  state.bargeInArmed = false;
+  state.bargeCandidateAt = 0;
   const capture = state.recorderContext;
   if (!capture || capture.recorder.state === "inactive") return;
   capture.accepted = false;
@@ -374,6 +437,11 @@ function confirmBargeIn() {
   const capture = state.recorderContext;
   const startedAt = state.bargeCandidateAt;
   if (!capture || capture.mode !== "barge" || !startedAt) return;
+  // Abort the still-buffering speech request before accepting the new turn.
+  // By normal audible playback the WAV has already arrived, so clearAudio()
+  // remains the immediate interruption path for the speaker.
+  if (state.pendingAbort) state.pendingAbort.abort();
+  state.bargeInArmed = false;
   capture.accepted = true;
   capture.turnEpoch = ++state.turnEpoch;
   clearAudio();
@@ -386,14 +454,23 @@ function confirmBargeIn() {
 }
 
 function detectBargeIn(rms, now) {
-  if ((!state.currentAudio && !state.currentSpeech) || now - state.speakingStartedAt < BARGE_IN_GRACE_MS) return;
+  if (!state.bargeInArmed) return;
+  // There is no speaker echo while Kokoro is still preparing the WAV, so allow
+  // a new question then. Once playback begins, retain the anti-echo grace.
+  const isPlaying = Boolean(state.currentAudio || state.currentSpeech);
+  const candidatePredatesPlayback = Boolean(
+    state.bargeCandidateAt && state.bargeCandidateAt < state.speakingStartedAt,
+  );
+  if (isPlaying && !candidatePredatesPlayback && now - state.speakingStartedAt < BARGE_IN_GRACE_MS) return;
   const threshold = Math.max(BARGE_IN_MIN_THRESHOLD, state.voiceThreshold * BARGE_IN_THRESHOLD_MULTIPLIER);
   if (rms <= threshold) {
     if (state.bargeCandidateAt) discardBargeCapture();
     return;
   }
   if (!state.bargeCandidateAt) {
-    if (startRecorder("barge")) state.bargeCandidateAt = now;
+    const capture = state.recorderContext;
+    const hasPreArmedCapture = capture?.mode === "barge" && capture.recorder.state !== "inactive";
+    if (hasPreArmedCapture || startRecorder("barge")) state.bargeCandidateAt = now;
     return;
   }
   if (now - state.bargeCandidateAt >= BARGE_IN_CONFIRMATION_MS) confirmBargeIn();
@@ -419,7 +496,7 @@ function analyseMicrophone() {
   updateMeter(rms);
   const now = performance.now();
 
-  if (state.phase === "speaking") {
+  if (state.phase === "speaking" || state.bargeInArmed) {
     detectBargeIn(rms, now);
   } else if (state.phase === "listening") {
     if (now < state.calibrationUntil) {
@@ -463,7 +540,7 @@ function analyseMicrophone() {
 function armNextTurn(announcement = "Pitchroom is listening again.", retainNotice = false) {
   if (!state.active || !state.stream) return;
   if (!retainNotice) clearError();
-  discardBargeCapture();
+  disarmBargeCapture();
   state.calibrationUntil = performance.now() + Math.min(420, CALIBRATION_MS);
   setPhase("listening", announcement);
   if (!startRecorder()) {
@@ -516,6 +593,7 @@ function stopLiveSession() {
   state.sessionId += 1;
   state.turnEpoch += 1;
   state.active = false;
+  state.bargeInArmed = false;
   if (state.pendingAbort) {
     state.pendingAbort.abort();
     state.pendingAbort = null;
@@ -563,6 +641,43 @@ async function requestSpeech(text, signal) {
     throw error;
   }
   return response.blob();
+}
+
+function setVoiceReadiness(message, status = "checking") {
+  elements.voiceReadiness.textContent = message;
+  elements.voiceReadiness.dataset.state = status;
+}
+
+function warmSpeechProvider() {
+  // This endpoint warms only an explicitly selected local Kokoro model. It is
+  // deliberately a no-op for browser and hosted voice settings, so opening the
+  // live room never spends provider credits or sends an answer to a provider.
+  if (state.speechWarmPromise) return state.speechWarmPromise;
+  setVoiceReadiness("Checking the selected voice…");
+  state.speechWarmPromise = fetch("/api/voice/warm", { method: "POST" })
+    .then(async (response) => {
+      let readiness = {};
+      try { readiness = await response.json(); } catch (_) { /* retain fallback below */ }
+      if (!response.ok) {
+        setVoiceReadiness("Studio voice unavailable — browser voice will take over.", "fallback");
+        return false;
+      }
+      if (readiness.provider === "kokoro" && readiness.ready) {
+        setVoiceReadiness("Studio voice ready · local English", "ready");
+        return true;
+      }
+      if (readiness.provider === "browser") {
+        setVoiceReadiness("Free browser voice ready", "ready");
+        return true;
+      }
+      setVoiceReadiness("Server voice selected · it will be checked on the first answer.");
+      return Boolean(readiness.ready);
+    })
+    .catch(() => {
+      setVoiceReadiness("Voice check unavailable — browser voice will take over.", "fallback");
+      return false;
+    });
+  return state.speechWarmPromise;
 }
 
 function selectBrowserVoice() {
@@ -620,7 +735,7 @@ function playBrowserSpeech(text, resumeWhenFinished) {
     };
     try {
       window.speechSynthesis.speak(utterance);
-      if (state.active && resumeWhenFinished) startRecorder("barge");
+      if (state.active && resumeWhenFinished) armBargeCapture();
     } catch (error) {
       finish(error instanceof Error ? error : new Error("The local browser voice could not start."));
     }
@@ -636,6 +751,7 @@ async function playAnswer(text, resumeWhenFinished, signal) {
     if (error?.name === "AbortError" || signal?.aborted) throw error;
     const serverMessage = error?.message || "The server speech provider is unavailable.";
     elements.liveAnnouncement.textContent = "Server voice unavailable. Switching to the free browser voice.";
+    setVoiceReadiness("Browser voice fallback active", "fallback");
     try {
       await playBrowserSpeech(text, resumeWhenFinished);
     } catch (browserError) {
@@ -653,14 +769,14 @@ async function playBlob(blob, resumeWhenFinished) {
   state.currentAudioUrl = audioUrl;
   audio.addEventListener("ended", () => {
     if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
-    discardBargeCapture();
+    disarmBargeCapture();
     clearAudio();
     if (resumeWhenFinished || state.active) armNextTurn("Answer complete. Pitchroom is listening again.");
     else setPhase("ready", "Answer playback complete.");
   }, { once: true });
   audio.addEventListener("error", () => {
     if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
-    discardBargeCapture();
+    disarmBargeCapture();
     clearAudio();
     if (resumeWhenFinished || state.active) armNextTurn("Audio playback was interrupted. Pitchroom is listening again.");
   }, { once: true });
@@ -669,11 +785,11 @@ async function playBlob(blob, resumeWhenFinished) {
   try {
     await audio.play();
     if (playbackId !== state.playbackId || state.currentAudio !== audio) return;
-    if (state.active && resumeWhenFinished) startRecorder("barge");
+    if (state.active && resumeWhenFinished) armBargeCapture();
   } catch (error) {
     if (playbackId !== state.playbackId) return;
     elements.playAnswer.hidden = false;
-    discardBargeCapture();
+    disarmBargeCapture();
     if (resumeWhenFinished) armNextTurn("The answer is ready. This browser needs one tap to play it; Pitchroom is listening again.");
     else setPhase(state.active ? "listening" : "ready", "Answer audio is ready to play.");
   }
@@ -698,6 +814,9 @@ async function processVoiceTurn(blob, sessionId, turnEpoch) {
     renderAnswer(answerData);
     try {
       if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
+      // Start retaining a possible interruption before the server finishes
+      // buffering the WAV. This closes the otherwise lost sub-second gap.
+      armBargeCapture();
       await playAnswer(answerData.answer, true, controller.signal);
     } catch (speechError) {
       if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
@@ -722,6 +841,14 @@ async function askTypedQuestion(event) {
   }
   clearError();
   const wasActive = state.active;
+  if (wasActive) {
+    // A deliberate typed question takes ownership from any live turn that is
+    // still transcribing or buffering speech, so stale audio cannot return.
+    state.turnEpoch += 1;
+    if (state.pendingAbort) state.pendingAbort.abort();
+    disarmBargeCapture();
+    clearAudio();
+  }
   if (state.recorder && state.recorder.state !== "inactive") {
     // Do not let a partly spoken live turn race the intentional typed question.
     state.hasSpoken = false;
@@ -749,19 +876,42 @@ async function manuallyPlayAnswer() {
   if (!state.lastAnswer) return;
   clearError();
   elements.playAnswer.disabled = true;
+  let manualController = null;
+  let manualTurnEpoch = null;
   try {
-    if (state.active) await pauseCaptureForPlayback();
-    if (state.currentAudio && state.currentAudio.src) {
+    const readyAudio = state.currentAudio?.src ? state.currentAudio : null;
+    if (readyAudio) {
+      if (state.active) await pauseCaptureForPlayback();
       state.speakingStartedAt = performance.now();
       setPhase("speaking", "Pitchroom is answering aloud.");
-      await state.currentAudio.play();
-      if (state.active) startRecorder("barge");
+      await readyAudio.play();
+      if (state.active) armBargeCapture();
       return;
     }
-    await playAnswer(state.lastAnswer, state.active);
+    if (state.active) {
+      // Manual playback is an explicit ownership handoff from any automatic
+      // live reply that may still be buffering in the background.
+      state.turnEpoch += 1;
+      if (state.pendingAbort) state.pendingAbort.abort();
+      disarmBargeCapture();
+      clearAudio();
+      await pauseCaptureForPlayback();
+    }
+    manualTurnEpoch = state.turnEpoch;
+    if (state.active) {
+      manualController = new AbortController();
+      state.pendingAbort = manualController;
+    }
+    if (state.active) armBargeCapture();
+    await playAnswer(state.lastAnswer, state.active, manualController?.signal);
+    if (manualController?.signal.aborted || manualTurnEpoch !== state.turnEpoch) return;
   } catch (error) {
+    if (error?.name === "AbortError" || (manualTurnEpoch !== null && manualTurnEpoch !== state.turnEpoch)) return;
+    disarmBargeCapture();
     showError(`Could not play the answer: ${error.message}`, true);
+    if (state.active) armNextTurn("Voice playback could not start. Pitchroom is listening again.", true);
   } finally {
+    if (manualController && state.pendingAbort === manualController) state.pendingAbort = null;
     elements.playAnswer.disabled = false;
   }
 }
@@ -779,6 +929,9 @@ function bindEvents() {
 
 async function initialise() {
   bindEvents();
+  // Start warming while the demo source loads. If Kokoro is selected, model
+  // setup happens before the presenter asks the first question.
+  void warmSpeechProvider();
   try {
     await loadPitch();
   } catch (error) {

@@ -107,6 +107,9 @@ h2 { margin-bottom: 0; font-size: 1.12rem; font-weight: 750; letter-spacing: -0.
 .stage-message p:last-child { margin-bottom: 0; color: var(--muted); font-size: 0.83rem; line-height: 1.58; }
 .stage-controls { display: grid; justify-items: center; gap: 0.7rem; margin-top: 1.35rem; }
 .control-hint { margin-bottom: 0; color: var(--muted); font-size: 0.72rem; }
+.voice-readiness { margin: -0.25rem 0 0; color: var(--muted); font-size: 0.72rem; font-weight: 650; }
+.voice-readiness[data-state="ready"] { color: var(--green); }
+.voice-readiness[data-state="fallback"] { color: #a46a17; }
 .voice-error { margin: 1rem 0 0; padding: 0.7rem 0.8rem; border: 1px solid #ffd3d7; border-radius: 8px; background: var(--red-pale); color: #982d38; font-size: 0.76rem; line-height: 1.45; }
 
 .conversation-card { display: flex; min-height: 570px; flex-direction: column; padding: 1.45rem; }
