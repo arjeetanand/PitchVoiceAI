@@ -1,6 +1,6 @@
 # Pitchroom AI live-room frontend
 
-`static/` is a dependency-free browser application served by FastAPI at `/`. It is designed for a hackathon presentation rather than a manual recorder workflow.
+`static/` is a no-build browser application served by FastAPI at `/`. It is designed for a hackathon presentation rather than a manual recorder workflow.
 
 There is no separate Python frontend process; start the backend with the root
 `./run-dev.sh` command and it serves this browser application and the API from
@@ -27,4 +27,8 @@ Open `http://127.0.0.1:8501`. The interface and API intentionally share one orig
 
 An explicit **End live session** control stays available. A typed source-question form is the presentation fallback. The live loop needs an HTTPS page outside `localhost`; use Chrome or Edge for the most predictable demo behavior. Headphones are the most reliable setup for interruption because acoustic echo cancellation varies by venue and microphone.
 
-The 3D voice orb asset lives at `static/assets/pitchroom-voice-orb.png`. Its visual states are decorative and respect `prefers-reduced-motion`; VAD does not depend on animation.
+## Visual layer
+
+`static/scene.js` lazily imports a pinned Three.js module and renders one decorative, scroll-responsive particle field behind the semantic page. It morphs through the five story scenes and gently responds to voice state and microphone energy, while the actual controls, transcript, and evidence remain ordinary accessible HTML.
+
+The visual layer caps device pixel ratio and particle density, pauses when the document is hidden, and respects `prefers-reduced-motion`. If the optional module cannot be reached—for example, on a presentation network that blocks the CDN—the canvas hides and the live room remains fully usable.

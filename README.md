@@ -18,6 +18,7 @@ Pitchroom AI gives founder-led teams a rehearsal space that keeps the approved s
 - Runs hands-free turns: speech detected → pause detected → transcription → grounded answer → spoken reply → microphone re-armed.
 - Stops a spoken reply when the presenter interrupts and treats the interruption as the next question.
 - Shows the transcript, answer, and exact source sections used.
+- Presents the demo through five normal-scroll scenes with a lightweight, reactive 3D particle field—no scroll-jacking or canvas-only controls.
 - Includes a verified demo brief with facts about the working prototype.
 
 The experience is seamless turn-taking, not streaming transcription: a presenter starts the room once, then a short pause ends each question automatically. The active document stays in memory and is shared by the running API, so this is suitable for a controlled hackathon demo rather than multi-user production use.
@@ -94,7 +95,7 @@ for interruption because acoustic echo cancellation varies by venue.
 
 | Path | Purpose |
 | --- | --- |
-| `frontend/static/` | The dependency-free browser live room, voice orb, VAD, barge-in handling, transcript, and source evidence UI. |
+| `frontend/static/` | The browser live room, responsive Three.js particle field, VAD, barge-in handling, transcript, and source-evidence UI. |
 | `backend/app.py` | FastAPI entrypoint; serves the browser room and `/api` from one origin. |
 | `backend/routes/pitch.py` | Document ingestion, grounded answers, transcription, and speech-provider integrations. |
 | `backend/config.py` | Loads the root `.env` and owns the supported setting names and defaults. |
@@ -118,6 +119,7 @@ The full speaking script and fallback plan are in [docs/hackathon-runbook.md](do
 ```bash
 .venv/bin/python -m pytest backend -q
 node --check frontend/static/app.js
+node --check frontend/static/scene.js
 ```
 
 ## Deployment

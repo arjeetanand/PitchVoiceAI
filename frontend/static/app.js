@@ -19,10 +19,8 @@ const elements = {
   stateLabel: document.querySelector("#state-label"),
   stageTitle: document.querySelector("#stage-message-title"),
   stageCopy: document.querySelector("#stage-message-copy"),
-  topToggle: document.querySelector("#live-toggle"),
-  topToggleLabel: document.querySelector("#live-toggle-label"),
-  stageToggle: document.querySelector("#live-toggle-stage"),
-  stageToggleLabel: document.querySelector("#live-toggle-stage-label"),
+  liveToggles: [...document.querySelectorAll("[data-live-session-toggle]")],
+  liveToggleLabels: [...document.querySelectorAll("[data-live-session-toggle] span[data-idle-label]")],
   liveHint: document.querySelector("#live-hint"),
   voiceReadiness: document.querySelector("#voice-readiness"),
   liveAnnouncement: document.querySelector("#live-announcement"),
@@ -45,6 +43,7 @@ const elements = {
   flowSource: document.querySelector("#flow-source"),
   flowAnswer: document.querySelector("#flow-answer"),
   meterBars: [...document.querySelectorAll(".voice-meter span")],
+  questionPrompts: [...document.querySelectorAll("[data-question]")],
 };
 
 const state = {
@@ -124,6 +123,9 @@ const phaseCopy = {
 function setPhase(phase, announcement = "") {
   state.phase = phase;
   elements.stage.className = `stage-card is-${phase}`;
+  document.documentElement.dataset.voicePhase = phase;
+  window.PitchroomScene?.setPhase?.(phase);
+  window.dispatchEvent(new CustomEvent("pitchroom:voice-phase", { detail: { phase } }));
   const copy = phaseCopy[phase] || phaseCopy.ready;
   elements.stateLabel.textContent = copy.label;
   elements.stageTitle.textContent = copy.title;
@@ -131,10 +133,13 @@ function setPhase(phase, announcement = "") {
   elements.liveHint.textContent = copy.hint;
   const isActive = state.active;
   const buttonText = isActive ? "End live session" : "Start live session";
-  elements.topToggleLabel.textContent = buttonText;
-  elements.stageToggleLabel.textContent = buttonText;
-  elements.topToggle.setAttribute("aria-pressed", String(isActive));
-  elements.stageToggle.setAttribute("aria-pressed", String(isActive));
+  elements.liveToggleLabels.forEach((label) => {
+    label.textContent = isActive ? buttonText : (label.dataset.idleLabel || buttonText);
+  });
+  elements.liveToggles.forEach((toggle) => {
+    toggle.setAttribute("aria-pressed", String(isActive));
+    toggle.setAttribute("aria-label", isActive ? "End live session" : (toggle.querySelector("[data-idle-label]")?.dataset.idleLabel || buttonText));
+  });
   if (announcement) elements.liveAnnouncement.textContent = announcement;
   updateFlow();
 }
@@ -181,7 +186,14 @@ function setAnswerPlaceholder() {
   elements.playAnswer.hidden = true;
   elements.evidenceStatus.textContent = "Load a question to see the exact source section used.";
   elements.evidenceList.innerHTML = '<p class="empty-evidence">No answer yet. Pitchroom will show the source sentences behind each grounded response.</p>';
+  syncSceneGrounding(null);
   updateFlow();
+}
+
+function syncSceneGrounding(grounded) {
+  document.documentElement.dataset.answerGrounded = String(grounded);
+  window.PitchroomScene?.setGrounded?.(grounded);
+  window.dispatchEvent(new CustomEvent("pitchroom:answer-grounding", { detail: { grounded } }));
 }
 
 function setHeard(question) {
@@ -194,6 +206,7 @@ function renderAnswer(answerData) {
   elements.answer.textContent = state.lastAnswer || "I could not find that in the pitch document.";
   elements.answer.classList.remove("placeholder");
   const grounded = Boolean(answerData.grounded);
+  syncSceneGrounding(grounded);
   elements.groundingBadge.textContent = grounded ? "Grounded in source" : "No matching source";
   elements.groundingBadge.className = `grounding-badge ${grounded ? "is-grounded" : "is-ungrounded"}`;
   const sources = Array.isArray(answerData.sources) ? answerData.sources : [];
@@ -482,6 +495,7 @@ function updateMeter(level) {
     const variance = [0.64, 1.05, 1.38, 0.88, 1.52, 1.08, 0.74, 1.22, 0.62][index];
     bar.style.setProperty("--meter-scale", String(Math.max(0.28, Math.min(1.8, scale * variance))));
   });
+  window.PitchroomScene?.setAudioLevel?.(level);
 }
 
 function analyseMicrophone() {
@@ -917,13 +931,34 @@ async function manuallyPlayAnswer() {
 }
 
 function bindEvents() {
-  elements.topToggle.addEventListener("click", startLiveSession);
-  elements.stageToggle.addEventListener("click", startLiveSession);
+  elements.liveToggles.forEach((toggle) => {
+    toggle.addEventListener("click", () => {
+      if (!state.active && toggle.hasAttribute("data-scroll-stage")) {
+        document.querySelector("#live-stage")?.scrollIntoView({
+          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+          block: "start",
+        });
+      }
+      startLiveSession();
+    });
+  });
   elements.demoReset.addEventListener("click", resetDemo);
   elements.demoResetSource.addEventListener("click", resetDemo);
   elements.sourceUpload.addEventListener("change", (event) => uploadPitch(event.target.files?.[0]));
   elements.textQuestionForm.addEventListener("submit", askTypedQuestion);
   elements.playAnswer.addEventListener("click", manuallyPlayAnswer);
+  elements.questionPrompts.forEach((prompt) => {
+    prompt.addEventListener("click", () => {
+      const question = String(prompt.dataset.question || "").trim();
+      if (!question) return;
+      elements.textQuestion.value = question;
+      document.querySelector("#live-stage")?.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
+      window.setTimeout(() => elements.textQuestion.focus(), 420);
+    });
+  });
   window.addEventListener("beforeunload", stopLiveSession);
 }
 
