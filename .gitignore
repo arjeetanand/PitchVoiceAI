@@ -14,3 +14,7 @@ threeui/
 # Locally generated presentation staging and render previews.
 .codex-finalizer/
 .deck-build/
+
+threeui/
+motion-primitives/
+docs/

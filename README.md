@@ -26,15 +26,21 @@ The experience is seamless turn-taking, not streaming transcription: a presenter
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r backend/requirements.txt
-cp backend/.env.example .env
+cp .env.example .env
 ./run-dev.sh
 ```
 
 Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The included `pitch.txt` brief loads automatically. Use **Start live session** once, ask naturally, and pause to send the question. Use **Use demo brief** whenever a rehearsal needs a clean reset. Upload an approved text-based PDF, Markdown, or TXT file when rehearsing your own pitch.
 
-## Voice configuration
+## Configuration
 
-Copy `backend/.env.example` to the repository-root `.env` and configure only the providers you use:
+There is one configuration file: the repository-root `.env`. Start from the
+categorized [`.env.example`](.env.example), copy it to `.env`, and change only
+the values needed for your demo. The backend, deployment template, and legacy
+Streamlit wrapper all use this same configuration contract; there is no second
+backend env file.
+
+The most important settings are:
 
 - `TTS_PROVIDER=kokoro` is the recommended hackathon studio voice: a local, cached Kokoro English model with the curated `af_heart` narrator. Install it with `.venv/bin/python -m pip install -r backend/requirements-kokoro.txt`; its first model download is about 360 MB, then answer text stays on the presentation machine with no per-request TTS charge.
 - `TTS_PROVIDER=auto` enables the configured server-provider chain; add `SARVAM_API_KEY` to include Sarvam Bulbul.
@@ -42,6 +48,11 @@ Copy `backend/.env.example` to the repository-root `.env` and configure only the
 - `OPENAI_API_KEY` enables the OpenAI text-to-speech fallback.
 - `TTS_PROVIDER=browser` forces the free browser-native voice; it needs no API key and keeps reply text in the browser.
 - `TTS_PROVIDER=piper` plus `PIPER_TTS_URL` uses a free local Piper neural voice. Setup commands are in [backend/README.md](backend/README.md).
+
+The remaining provider settings are grouped in `.env.example` under speech-to-
+text, local voice, hosted voice, and legacy-wrapper sections. You do not need
+to fill every key. The old `assembleAI` entry is not part of the supported
+configuration because no current code uses it.
 
 Kokoro starts warming as the live room opens, loading its model and narrator while the presenter gets ready. On its first install it downloads the public model artifacts from Hugging Face (not your answer text); after that cache is present, answers stay on the presentation machine and the demo can run offline for TTS. For the first launch, wait until the page is fully open before the first question; later answers use the in-memory model. This avoids a provider round trip, but it is not literal streaming audio—keep live answers to one to three sentences for the quickest response. Use `KOKORO_VOICE=af_bella` to audition the alternative high-quality English narrator, then keep one voice consistent for the demo.
 

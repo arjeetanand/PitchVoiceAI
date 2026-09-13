@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+ALLOW_CUSTOM_BACKEND_URL = os.getenv("ALLOW_CUSTOM_BACKEND_URL", "false").strip().lower() in {"1", "true", "yes"}
 
 st.set_page_config(
     page_title="Pitchroom | Voice pitch assistant",
@@ -97,6 +98,64 @@ def show_api_error(response: requests.Response) -> None:
     st.error(f"Backend error ({response.status_code}): {response_detail(response)}")
 
 
+def reset_answer_state() -> None:
+    st.session_state.answer = None
+    st.session_state.answer_audio = None
+    st.session_state.answer_audio_format = None
+    st.session_state.answer_audio_error = None
+    st.session_state.answer_audio_autoplay = False
+    st.session_state.last_heard_question = None
+
+
+def load_active_pitch() -> bool:
+    """Load the server's current approved source without triggering speech synthesis."""
+    try:
+        pitch_response = api_request("GET", "/api/pitch")
+        if not pitch_response.ok:
+            show_api_error(pitch_response)
+            return False
+        st.session_state.pitch = pitch_response.json()
+        st.session_state.pitch_audio = None
+        st.session_state.pitch_audio_format = "audio/wav"
+        st.session_state.pitch_audio_error = None
+        reset_answer_state()
+        return True
+    except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
+        st.error(f"Could not load the pitch: {exc}")
+        return False
+
+
+def load_demo_pitch() -> bool:
+    """Restore the bundled demo brief before loading the workspace."""
+    try:
+        demo_response = api_request("POST", "/api/pitch/demo")
+        if not demo_response.ok:
+            show_api_error(demo_response)
+            return False
+        return load_active_pitch()
+    except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
+        st.error(f"Could not restore the demo source: {exc}")
+        return False
+
+
+def read_loaded_pitch() -> None:
+    """Request pitch narration only when the presenter asks for it."""
+    if st.session_state.pitch is None:
+        st.warning("Load a pitch before asking Pitchroom to read it aloud.")
+        return
+    with st.spinner("Preparing pitch audio..."):
+        try:
+            audio_response = api_request("POST", "/api/pitch/read", timeout=90)
+            if audio_response.ok and audio_response.content:
+                st.session_state.pitch_audio = audio_response.content
+                st.session_state.pitch_audio_format = response_audio_format(audio_response)
+                st.session_state.pitch_audio_error = None
+            else:
+                st.session_state.pitch_audio_error = response_detail(audio_response)
+        except requests.RequestException as exc:
+            st.session_state.pitch_audio_error = str(exc)
+
+
 def process_uploaded_file(uploaded_file: Any) -> None:
     uploaded_bytes = uploaded_file.getvalue()
     uploaded_hash = hashlib.sha256(uploaded_bytes).hexdigest()
@@ -119,41 +178,17 @@ def process_uploaded_file(uploaded_file: Any) -> None:
             if not upload_response.ok:
                 show_api_error(upload_response)
                 return
-
-            pitch_response = api_request("GET", "/api/pitch")
-            if not pitch_response.ok:
-                show_api_error(pitch_response)
-                return
-            next_pitch = pitch_response.json()
         except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
             st.error(f"Upload failed: {exc}")
             st.session_state.processed_file_hash = None
             return
 
-        next_audio = None
-        next_audio_format = "audio/wav"
-        next_audio_error = None
-        try:
-            audio_response = api_request("POST", "/api/pitch/read", timeout=90)
-            if audio_response.ok and audio_response.content:
-                next_audio = audio_response.content
-                next_audio_format = response_audio_format(audio_response)
-            else:
-                next_audio_error = response_detail(audio_response)
-        except requests.RequestException as exc:
-            next_audio_error = str(exc)
+        if not load_active_pitch():
+            st.session_state.processed_file_hash = None
+            return
 
         st.session_state.processed_file_hash = uploaded_hash
         st.session_state.processed_recording_hash = None
-        st.session_state.pitch = next_pitch
-        st.session_state.answer = None
-        st.session_state.pitch_audio = next_audio
-        st.session_state.pitch_audio_format = next_audio_format
-        st.session_state.answer_audio = None
-        st.session_state.answer_audio_format = None
-        st.session_state.pitch_audio_error = next_audio_error
-        st.session_state.answer_audio_error = None
-        st.session_state.last_heard_question = None
         st.session_state.clear_typed_question = True
         st.rerun()
 
@@ -171,6 +206,7 @@ def answer_from_question(question: str) -> None:
             st.session_state.answer_audio = None
             st.session_state.answer_audio_format = None
             st.session_state.answer_audio_error = None
+            st.session_state.answer_audio_autoplay = False
         else:
             show_api_error(response)
     except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
@@ -218,21 +254,21 @@ def process_voice_recording(recording: Any) -> None:
 
             st.session_state.answer = answer_response.json()
             st.session_state.last_heard_question = question_text
-            if st.session_state.answer["grounded"]:
-                try:
-                    audio_response = api_request(
-                        "POST",
-                        "/api/voice/speak",
-                        json={"text": st.session_state.answer["answer"]},
-                        timeout=90,
-                    )
-                    if audio_response.ok and audio_response.content:
-                        st.session_state.answer_audio = audio_response.content
-                        st.session_state.answer_audio_format = response_audio_format(audio_response)
-                    else:
-                        st.session_state.answer_audio_error = response_detail(audio_response)
-                except requests.RequestException as exc:
-                    st.session_state.answer_audio_error = str(exc)
+            try:
+                audio_response = api_request(
+                    "POST",
+                    "/api/voice/speak",
+                    json={"text": st.session_state.answer["answer"]},
+                    timeout=90,
+                )
+                if audio_response.ok and audio_response.content:
+                    st.session_state.answer_audio = audio_response.content
+                    st.session_state.answer_audio_format = response_audio_format(audio_response)
+                    st.session_state.answer_audio_autoplay = True
+                else:
+                    st.session_state.answer_audio_error = response_detail(audio_response)
+            except requests.RequestException as exc:
+                st.session_state.answer_audio_error = str(exc)
             st.session_state.processed_recording_hash = recording_hash
         except (KeyError, requests.RequestException, TypeError, ValueError) as exc:
             st.error(f"Voice conversation failed: {exc}")
@@ -249,6 +285,7 @@ for key, default in {
     "pitch_audio_format": "audio/wav",
     "answer_audio": None,
     "answer_audio_format": "audio/wav",
+    "answer_audio_autoplay": False,
     "pitch_audio_error": None,
     "answer_audio_error": None,
     "last_heard_question": None,
@@ -716,20 +753,218 @@ st.markdown(
 )
 
 
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Serif+Display:ital@0;1&display=swap');
+
+    :root {
+        --pr-canvas: #060816;
+        --pr-panel: rgba(12, 17, 38, 0.76);
+        --pr-panel-solid: #0d1228;
+        --pr-panel-raised: #141b38;
+        --pr-ink: #f5f5ff;
+        --pr-ink-soft: #c8cce3;
+        --pr-muted: #9198bb;
+        --pr-subtle: #6b7296;
+        --pr-blue: #7888ff;
+        --pr-blue-dark: #5e70f0;
+        --pr-sky: #1b3565;
+        --pr-sky-soft: #101d3c;
+        --pr-lavender: #25224f;
+        --pr-mint: #102f35;
+        --pr-line: rgba(174, 187, 255, 0.15);
+        --pr-line-strong: rgba(174, 187, 255, 0.31);
+        --pr-white: #ffffff;
+        --pr-shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+    }
+
+    html { background: var(--pr-canvas); }
+    .stApp {
+        position: relative;
+        min-height: 100vh;
+        overflow: visible;
+        background:
+            radial-gradient(ellipse 52% 30% at 76% 5%, rgba(75, 103, 255, 0.29), transparent 72%),
+            radial-gradient(ellipse 38% 22% at 37% 21%, rgba(57, 185, 255, 0.15), transparent 72%),
+            radial-gradient(ellipse 26% 20% at 71% 51%, rgba(126, 64, 255, 0.12), transparent 76%),
+            var(--pr-canvas);
+        color: var(--pr-ink);
+    }
+    .stApp::before {
+        position: fixed;
+        z-index: 0;
+        top: -18vh;
+        left: 34%;
+        width: 54vw;
+        height: 64vh;
+        border-radius: 50%;
+        background: linear-gradient(122deg, transparent 32%, rgba(98, 217, 255, 0.09) 49%, rgba(130, 94, 255, 0.16) 59%, transparent 76%);
+        content: '';
+        filter: blur(22px);
+        opacity: .95;
+        pointer-events: none;
+        transform: rotate(-12deg);
+        animation: pr-drift 14s ease-in-out infinite alternate;
+    }
+    @keyframes pr-drift { to { transform: rotate(-6deg) translate3d(2vw, 2vh, 0) scale(1.06); } }
+    [data-testid="stAppViewContainer"] { position: relative !important; min-height: 100vh; overflow: visible !important; background: transparent; }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stBaseButton-header"] { display: none !important; }
+    [data-testid="stHeader"], [data-testid="stToolbar"] { position: relative; z-index: 2; }
+    [data-testid="stMainBlockContainer"], .block-container { position: relative; z-index: 1; max-width: 1280px; padding-top: .65rem; padding-bottom: 4rem; }
+    h1, h2, h3, h4, p, label, button, input, textarea, [data-testid="stMarkdownContainer"] { font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    h1, h2, h3, h4, p { color: var(--pr-ink); }
+
+    .pr-topbar { min-height: 68px; padding: .78rem 0 1.15rem; border-bottom: 1px solid var(--pr-line); }
+    .pr-brand { color: var(--pr-ink); font-size: 1.15rem; font-weight: 700; letter-spacing: -0.045em; }
+    nav.pr-topbar a.pr-brand, nav.pr-topbar a.pr-brand:hover { color: var(--pr-ink) !important; }
+    .pr-brand-mark { width: 34px; height: 34px; border: 1px solid rgba(128, 145, 255, 0.48); border-radius: 10px; background: linear-gradient(145deg, rgba(124, 140, 255, .32), rgba(39, 211, 255, .08)); color: #aab6ff; box-shadow: inset 0 1px 0 rgba(255,255,255,.13), 0 0 24px rgba(100, 126, 255, .18); }
+    .pr-nav { gap: 1.8rem; }
+    .pr-nav a { color: var(--pr-muted); font-size: .8rem; font-weight: 600; }
+    .pr-nav a:hover { color: #c4cbff; }
+    .pr-nav-cta, .pr-primary-cta { border: 1px solid rgba(160, 174, 255, .48); border-radius: 10px; background: linear-gradient(110deg, #6077f6, #896bff); color: white !important; box-shadow: 0 10px 30px rgba(92, 107, 255, .26), inset 0 1px 0 rgba(255,255,255,.22); }
+    .pr-nav-cta { min-height: 2.55rem; padding: .5rem 1rem; font-size: .78rem; }
+    .pr-primary-cta { min-height: 3.2rem; padding: .75rem 1.28rem; font-size: .89rem; }
+    .pr-nav-cta:hover, .pr-primary-cta:hover { border-color: #b9c3ff; background: linear-gradient(110deg, #7187ff, #9c7cff); box-shadow: 0 15px 35px rgba(92, 107, 255, .34); transform: translateY(-2px); }
+
+    .pr-hero { grid-template-columns: minmax(0, 1.05fr) minmax(460px, .95fr); gap: clamp(2.5rem, 3.5vw, 4.25rem); min-height: 530px; padding: 4.7rem 0 4.6rem; }
+    .pr-hero-copy h1 { max-width: 620px; color: var(--pr-ink); font-family: 'DM Serif Display', Georgia, serif; font-size: clamp(3.8rem, 4.4vw, 5.1rem); font-weight: 400; letter-spacing: -.052em; line-height: .92; }
+    .pr-hero-copy h1 span { margin-top: .12em; background: linear-gradient(105deg, #a18dff 8%, #9bb3ff 58%, #a6e8ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .pr-hero-copy p { max-width: 455px; margin: 1.75rem 0 2.15rem; color: #bbc2e3; font-size: 1.03rem; line-height: 1.7; }
+    .pr-hero-wave { z-index: 0; right: -3.4rem; bottom: -2rem; opacity: .28; }
+    .pr-hero-wave path:first-child { stroke: #6f8aff; }
+    .pr-hero-wave path:last-child { stroke: #8cdeff; }
+
+    .pr-product-preview { border: 1px solid rgba(158, 176, 255, .23); border-radius: 15px; background: linear-gradient(145deg, rgba(17, 28, 60, .91), rgba(7, 12, 28, .92)); box-shadow: var(--pr-shadow), 0 0 0 1px rgba(120, 138, 255, .06), inset 0 1px 0 rgba(255,255,255,.08); }
+    .pr-product-preview::before { top: -7rem; right: -1rem; width: 21rem; height: 18rem; background: radial-gradient(circle, rgba(99, 140, 255, .38), transparent 66%); filter: blur(11px); }
+    .pr-product-preview::after { position: absolute; z-index: 0; right: 12%; bottom: -16%; width: 60%; height: 36%; border-radius: 50%; background: rgba(91, 100, 255, .18); content: ''; filter: blur(42px); pointer-events: none; }
+    .pr-preview-toolbar { min-height: 3.5rem; border-bottom-color: var(--pr-line); background: rgba(7, 12, 29, .7); }
+    .pr-preview-toolbar-brand, .pr-preview-file { color: var(--pr-ink); }
+    .pr-preview-toolbar-brand { font-size: .9rem; }
+    .pr-preview-toolbar-brand .pr-icon, .pr-preview-file .pr-icon { color: #94a5ff; }
+    .pr-preview-file { color: #a7afd1; font-size: .72rem; }
+    .pr-preview-menu { color: #7d86aa; }
+    .pr-preview-body { position: relative; z-index: 1; gap: .7rem; padding: .7rem; }
+    .pr-preview-document, .pr-preview-agent { min-height: 340px; border-color: rgba(161, 178, 255, .16); border-radius: 11px; background: rgba(7, 12, 28, .65); }
+    .pr-preview-document { grid-template-columns: 52px minmax(0,1fr); }
+    .pr-preview-rail { border-right-color: rgba(161, 178, 255, .14); background: rgba(17, 26, 54, .65); }
+    .pr-preview-thumb { border-color: rgba(151, 174, 255, .15); border-radius: 6px; background: linear-gradient(145deg, #101a3d, #0a1025); color: #7783ad; }
+    .pr-preview-thumb.is-active { border-color: #7d91ff; background: linear-gradient(145deg, #263a7f, #1a1e55); color: #dfe3ff; box-shadow: 0 0 18px rgba(112, 134, 255, .28); }
+    .pr-preview-page { position: relative; overflow: hidden; padding: 1.5rem; background: linear-gradient(160deg, #f7f7ff 0%, #dfe7ff 62%, #bac8fa 100%); }
+    .pr-preview-page::after { position: absolute; right: -1.5rem; bottom: -3.5rem; width: 16rem; height: 11rem; border-radius: 50% 45% 0 0; background: linear-gradient(135deg, #223878, #5a75c7 55%, #211b56); content: ''; clip-path: polygon(0 78%, 24% 45%, 39% 63%, 59% 17%, 76% 52%, 100% 0, 100% 100%, 0 100%); opacity: .94; }
+    .pr-preview-page-title { position: relative; z-index: 1; max-width: 165px; color: #121b40; font-family: 'DM Serif Display', Georgia, serif; font-size: 2rem; font-weight: 400; letter-spacing: -.055em; line-height: .93; }
+    .pr-preview-page-copy { position: relative; z-index: 1; color: #3c4c7d; font-size: .65rem; }
+    .pr-preview-page-line { position: relative; z-index: 1; background: rgba(73, 91, 145, .21); }
+    .pr-preview-agent { padding: 1rem; background: rgba(8, 13, 32, .84); }
+    .pr-preview-agent-tabs { border-bottom-color: rgba(161, 178, 255, .15); color: #7f89ad; font-size: .66rem; }
+    .pr-preview-agent-tabs .is-active { color: #aab6ff; }
+    .pr-preview-mic-area { min-height: 154px; background: radial-gradient(circle at 50% 50%, rgba(95, 110, 255, .34), transparent 55%), #10173b; }
+    .pr-preview-mic { border-color: rgba(171, 184, 255, .24); background: linear-gradient(145deg, #7184ff, #725ddd); box-shadow: 0 0 30px rgba(113, 127, 255, .45); }
+    .pr-waveform span { background: #8fb0ff; }
+    .pr-preview-question { border-color: rgba(170, 187, 255, .2); background: rgba(21, 30, 62, .7); color: #a5afd1; }
+    .pr-preview-answer { background: rgba(26, 75, 88, .45); color: #b4f1e4; }
+    .pr-preview-answer-lines span { background: rgba(154, 244, 223, .22); }
+
+    .pr-process-section { margin-top: 0; border-top-color: var(--pr-line); border-bottom-color: var(--pr-line); background: linear-gradient(90deg, rgba(17, 24, 53, .68), rgba(8, 13, 32, .18), rgba(24, 17, 59, .48)); }
+    .pr-step:not(:last-child)::after { background: rgba(149, 164, 255, .36); }
+    .pr-step-icon { border-color: rgba(148, 165, 255, .25); border-radius: 12px; background: linear-gradient(145deg, rgba(88, 117, 250, .22), rgba(77, 198, 255, .08)); color: #a7b5ff; }
+    .pr-step-index, .pr-section-label { color: #a5b4ff; }
+    .pr-step h3 { color: var(--pr-ink); }
+    .pr-step p, .pr-section-intro p { color: var(--pr-muted); }
+    .pr-section-intro { margin-top: 5.3rem; }
+    .pr-section-intro h2 { font-family: 'DM Serif Display', Georgia, serif; color: var(--pr-ink); font-size: clamp(2.35rem, 3.5vw, 3.4rem); font-weight: 400; letter-spacing: -.045em; }
+
+    div[data-testid="stVerticalBlockBorderWrapper"] { border-color: rgba(159, 176, 255, .18) !important; border-radius: 16px !important; background: linear-gradient(145deg, rgba(16, 23, 51, .86), rgba(8, 12, 29, .82)) !important; box-shadow: var(--pr-shadow), inset 0 1px 0 rgba(255,255,255,.045); }
+    div[data-testid="stVerticalBlockBorderWrapper"] > div { border-radius: 16px !important; }
+    .pr-upload-head h3, .pr-panel-title h3 { color: var(--pr-ink); font-family: 'DM Serif Display', Georgia, serif; font-weight: 400; letter-spacing: -.035em; }
+    .pr-upload-head p, .pr-panel-title p { color: var(--pr-muted); }
+    .pr-upload-icon { border: 1px solid rgba(150, 169, 255, .2); background: rgba(110, 125, 255, .16); color: #afbbff; }
+    [data-testid="stFileUploader"] { border-color: rgba(125, 149, 255, .48); background: rgba(9, 15, 37, .62); }
+    [data-testid="stFileUploaderDropzoneInstructions"] { color: var(--pr-muted); }
+    [data-testid="stFileUploaderDropzoneInstructions"] > div:first-child { color: var(--pr-ink); }
+    [data-testid="stFileUploaderDropzone"] button { border-color: rgba(142, 159, 255, .42); background: rgba(108, 126, 255, .16); color: #bdc7ff; }
+    .pr-ready-state { border-color: rgba(147, 168, 255, .2); background: rgba(23, 36, 77, .62); color: var(--pr-muted); }
+    .pr-ready-state strong { color: var(--pr-ink); }
+    .pr-ready-check { background: linear-gradient(145deg, #7a8dff, #755fe0); }
+    .pr-source-bar { border-color: rgba(141, 164, 255, .24); background: linear-gradient(90deg, rgba(33, 57, 113, .65), rgba(19, 28, 65, .7)); }
+    .pr-source-file-icon { background: rgba(125, 143, 255, .18); color: #b8c3ff; }
+    .pr-source-kicker { color: #a7b8ee; }
+    .pr-source-name, .pr-field-label { color: var(--pr-ink); }
+    .pr-source-status { color: #88e5ce; }
+    .pr-status-dot { background: #65dfbd; box-shadow: 0 0 0 4px rgba(101, 223, 189, .12); }
+    .pr-audio-card { border-color: rgba(136, 159, 255, .23); background: rgba(32, 47, 105, .55); }
+    .pr-audio-card-label { color: #b3c0ff; }
+    .pr-transcript { border-color: var(--pr-line); background: rgba(5, 9, 23, .58); color: #c2c8e2; }
+    .pr-record-card { border-color: rgba(141, 160, 255, .24); background: linear-gradient(125deg, rgba(58, 52, 123, .62), rgba(19, 28, 67, .68)); }
+    .pr-record-mic { background: linear-gradient(145deg, #7e8fff, #6c58e0); box-shadow: 0 9px 23px rgba(103, 112, 255, .35); }
+    .pr-record-copy strong { color: var(--pr-ink); }
+    .pr-record-copy span, .pr-heard { color: var(--pr-muted); }
+    [data-testid="stAudioInput"] > div, [data-testid="stAudioInput"] > div > div, [data-testid="stAudioInput"] > div > div > div { background: rgba(14, 21, 49, .94) !important; }
+    [data-testid="stAudioInput"] > div > div { border-color: rgba(141, 160, 255, .28) !important; }
+    [data-testid="stAudioInput"] button { color: #aebaff !important; }
+    textarea, input { border-color: rgba(148, 165, 255, .3) !important; background: rgba(6, 10, 25, .66) !important; color: var(--pr-ink) !important; }
+    textarea:focus, input:focus { border-color: #8294ff !important; box-shadow: 0 0 0 3px rgba(114, 133, 255, .16) !important; }
+    textarea::placeholder, input::placeholder { color: #717a9e !important; }
+    div.stButton > button { border-color: rgba(160, 174, 255, .46); border-radius: 10px; background: linear-gradient(110deg, #657cf5, #856afb); box-shadow: 0 10px 26px rgba(89, 104, 255, .19), inset 0 1px 0 rgba(255,255,255,.18); }
+    div.stButton > button:hover { border-color: #b4c0ff; background: linear-gradient(110deg, #7288ff, #9679ff); box-shadow: 0 14px 30px rgba(89, 104, 255, .32); }
+    div.stButton > button:disabled { border-color: rgba(159, 171, 216, .15); background: #202641; }
+    div[data-testid="stDownloadButton"] > button { border-color: rgba(141, 160, 255, .33); background: rgba(47, 61, 123, .42); color: #b8c4ff !important; }
+    div[data-testid="stDownloadButton"] > button p, div[data-testid="stDownloadButton"] > button span { color: #b8c4ff !important; }
+    div[data-testid="stDownloadButton"] > button:hover { border-color: rgba(172, 188, 255, .54); background: rgba(77, 86, 171, .52); }
+    .pr-answer-card { border-color: rgba(104, 227, 195, .28); background: linear-gradient(140deg, rgba(13, 65, 72, .74), rgba(11, 38, 54, .78)); }
+    .pr-answer-head { color: #91ebd4; }
+    .pr-answer-copy { color: #d1eee9; }
+    .pr-answer-foot { border-top-color: rgba(136, 242, 215, .18); color: #8ed7ca; }
+    .pr-footer { border-top-color: var(--pr-line); color: var(--pr-subtle); }
+    a[aria-label="Link to heading"] { display: none !important; }
+
+    [data-testid="stSidebar"] { border-right-color: var(--pr-line); background: #080c1d; }
+    [data-testid="stSidebar"] * { color: var(--pr-ink); }
+    [data-testid="stSidebar"] .stButton > button { border-color: rgba(144, 161, 255, .33); background: rgba(58, 73, 149, .38); color: #b9c5ff !important; box-shadow: none; }
+    [data-testid="stSidebar"] .stButton > button p, [data-testid="stSidebar"] .stButton > button span { color: #b9c5ff !important; }
+    [data-testid="stSidebar"] .stButton > button:hover { background: rgba(90, 104, 205, .43); }
+    .pr-sidebar-title { color: var(--pr-ink); font-family: 'DM Serif Display', Georgia, serif; font-weight: 400; }
+    .pr-sidebar-copy, .pr-sidebar-note { color: var(--pr-muted); }
+    .pr-sidebar-note { border-top-color: var(--pr-line); }
+
+    @media (max-width: 980px) { .pr-hero { grid-template-columns: 1fr; min-height: auto; padding-top: 4rem; } .pr-product-preview { max-width: 800px; } }
+    @media (max-width: 720px) {
+        .pr-topbar { padding-bottom: 1rem; }
+        .pr-hero { padding: 3.4rem 0 4rem; }
+        .pr-hero-copy h1 { font-size: clamp(3.4rem, 16vw, 5rem); }
+        .pr-nav { gap: .8rem; }
+        .pr-process-section { background: rgba(13, 20, 46, .62); }
+        .pr-preview-page::after { width: 12rem; }
+    }
+    @media (prefers-reduced-motion: reduce) { .stApp::before { animation: none; } *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; } }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 with st.sidebar:
     st.markdown(f'<div class="pr-brand"><span class="pr-brand-mark">{icon("wave", 22)}</span>Pitchroom</div>', unsafe_allow_html=True)
     st.markdown('<div class="pr-sidebar-title">Session setup</div>', unsafe_allow_html=True)
-    st.markdown('<div class="pr-sidebar-copy">Connect the workspace to the FastAPI service that stores the approved pitch source.</div>', unsafe_allow_html=True)
-    st.session_state.backend_url = st.text_input(
-        "Backend URL",
-        value=st.session_state.backend_url,
-        help="The FastAPI service URL, for example http://localhost:8000.",
-    ).rstrip("/")
+    st.markdown('<div class="pr-sidebar-copy">The workspace is connected to the approved pitch service for this demo.</div>', unsafe_allow_html=True)
+    if ALLOW_CUSTOM_BACKEND_URL:
+        st.session_state.backend_url = st.text_input(
+            "Backend URL",
+            value=st.session_state.backend_url,
+            help="Developer setting. Use only a trusted FastAPI service URL.",
+        ).rstrip("/")
     if st.button("Check connection", use_container_width=True):
         try:
             health_response = api_request("GET", "/health", timeout=8)
             if health_response.ok:
+                health = health_response.json()
+                speech_ready = bool(health.get("huggingface_configured")) and health.get("speech_provider") != "none"
                 st.success("Backend is online")
+                if speech_ready:
+                    st.caption(f"Voice stack configured: transcription + {health['speech_provider']} speech.")
+                else:
+                    st.warning("Text answers are ready; configure transcription and speech before a voice demo.")
             else:
                 show_api_error(health_response)
         except requests.RequestException as exc:
@@ -756,9 +991,9 @@ st.markdown(
     <div id="top" class="pr-anchor"></div>
     <section class="pr-hero" aria-labelledby="hero-heading">
         <div class="pr-hero-copy">
-            <h1 id="hero-heading">Make the pitch<span>easy to hear.</span></h1>
-            <p>Upload the deck, let the room hear the story, then ask precise questions without leaving the source document.</p>
-            <a class="pr-primary-cta" href="#workspace">Upload your pitch {icon("upload", 18, 2.1)}</a>
+            <h1 id="hero-heading">Know your pitch.<span>Own the room.</span></h1>
+            <p>Turn your pitch into a conversation worth remembering. Hear the story, surface the detail, and walk into every room prepared.</p>
+            <a class="pr-primary-cta" href="#workspace">Open workspace {icon("arrow", 18, 2.1)}</a>
             <svg class="pr-hero-wave" viewBox="0 0 420 92" fill="none" aria-hidden="true">
                 <path d="M2 56C41 27 70 25 108 49c37 24 62 34 89 22 28-12 42-47 68-48 27-1 37 43 65 50 28 7 48-27 87-47" stroke="#c7e2ff" stroke-width="2" stroke-linecap="round"/>
                 <path d="M0 75c35-13 66-8 95 4 29 12 59 19 86 5 28-14 39-43 63-44 25-1 42 35 68 39 28 4 48-17 106-45" stroke="#e1efff" stroke-width="2" stroke-linecap="round"/>
@@ -779,8 +1014,8 @@ st.markdown(
                         <div class="pr-preview-thumb">04</div>
                     </div>
                     <div class="pr-preview-page">
-                        <div class="pr-preview-page-title">From<br>ideas to<br>impact</div>
-                        <div class="pr-preview-page-copy">A smarter, faster path to what’s next.</div>
+                        <div class="pr-preview-page-title">Go to<br>market</div>
+                        <div class="pr-preview-page-copy">A focused, scalable path from pilot to category leadership.</div>
                         <div class="pr-preview-page-line"></div>
                         <div class="pr-preview-page-line" style="width:54%"></div>
                     </div>
@@ -818,8 +1053,8 @@ st.markdown(
             <div class="pr-step">
                 <div class="pr-step-icon">{icon("message", 25, 1.9)}</div>
                 <div class="pr-step-index">03</div>
-                <h3>Talk with the pitch agent</h3>
-                <p>Ask precise questions from the source.</p>
+                <h3>Ask the room</h3>
+                <p>Ask the questions the room is already thinking.</p>
             </div>
         </div>
     </section>
@@ -837,7 +1072,7 @@ if pitch is None:
         <div class="pr-section-intro">
             <div>
                 <p class="pr-section-label">Workspace</p>
-                <h2>Load the pitch deck</h2>
+                <h2>Pitch document</h2>
             </div>
             <p>Bring the approved source into a focused space for playback and grounded questions.</p>
         </div>
@@ -849,7 +1084,7 @@ if pitch is None:
             f'''
             <div class="pr-upload-head">
                 <div>
-                    <h3>Choose a deck or document</h3>
+                <h3>Put the story on the table.</h3>
                     <p>Upload a PDF, Markdown, or plain-text file. The source stays at the center of every answer.</p>
                 </div>
                 <div class="pr-upload-icon">{icon("upload", 22, 1.9)}</div>
@@ -857,20 +1092,29 @@ if pitch is None:
             ''',
             unsafe_allow_html=True,
         )
-        uploaded_file = st.file_uploader(
-            "Upload a PDF, Markdown, or plain-text file",
-            type=["pdf", "md", "txt"],
-            label_visibility="collapsed",
-            key="pitch_file",
-        )
-        if uploaded_file is not None:
-            process_uploaded_file(uploaded_file)
+        demo_col, upload_col = st.columns([0.9, 1.1], gap="medium")
+        with demo_col:
+            st.caption("Demo-ready source")
+            st.write("Open the included fact sheet to rehearse the complete flow before loading your own approved pitch.")
+            if st.button("Load demo source", use_container_width=True, key="load_demo_source"):
+                if load_demo_pitch():
+                    st.rerun()
+        with upload_col:
+            st.caption("Use your own source")
+            uploaded_file = st.file_uploader(
+                "Upload a text-based PDF, Markdown, or plain-text file",
+                type=["pdf", "md", "txt"],
+                label_visibility="collapsed",
+                key="pitch_file",
+            )
+            if uploaded_file is not None:
+                process_uploaded_file(uploaded_file)
         if st.session_state.pitch is None:
             st.markdown(
                 f'''
                 <div class="pr-ready-state">
                     <span class="pr-ready-check">{icon("check", 15, 2.4)}</span>
-                    <div><strong>Waiting for a pitch deck</strong>Upload a document above to open its transcript and Q&amp;A workspace.</div>
+                    <div><strong>Ready when you are</strong>Load the demo source or upload an approved document to open its transcript and Q&amp;A workspace.</div>
                 </div>
                 ''',
                 unsafe_allow_html=True,
@@ -889,7 +1133,10 @@ else:
         unsafe_allow_html=True,
     )
     with st.container(border=True):
-        source = escape(str(pitch["source"]))
+        # The backend may report an absolute local path for the bundled demo
+        # source.  Present only the filename; judges need provenance, not a
+        # developer workstation path.
+        source = escape(Path(str(pitch["source"])).name or "Approved pitch source")
         st.markdown(
             f'''
             <div class="pr-source-bar">
@@ -909,6 +1156,8 @@ else:
                 f'<div class="pr-panel-title"><h3>Pitch transcript</h3><p>{len(pitch["text"]):,} characters</p></div>',
                 unsafe_allow_html=True,
             )
+            if st.button("Read pitch aloud", use_container_width=True, key="read_pitch_aloud"):
+                read_loaded_pitch()
             if st.session_state.pitch_audio is not None:
                 st.markdown(
                     f'<div class="pr-audio-card"><div class="pr-audio-card-label">{icon("play", 16)} Read it aloud</div>',
@@ -917,11 +1166,11 @@ else:
                 st.audio(
                     st.session_state.pitch_audio,
                     format=st.session_state.pitch_audio_format or "audio/wav",
-                    autoplay=True,
+                    autoplay=False,
                 )
                 st.markdown("</div>", unsafe_allow_html=True)
             elif st.session_state.pitch_audio_error:
-                st.info("Pitch loaded. Add a speech provider in .env to enable read-aloud playback.")
+                st.warning(f"Pitch loaded, but narration was unavailable: {st.session_state.pitch_audio_error}")
             st.markdown(
                 f'<div class="pr-transcript">{escape(str(pitch["text"]))}</div>',
                 unsafe_allow_html=True,
@@ -937,14 +1186,25 @@ else:
 
         with ask_col:
             st.markdown(
-                '<div class="pr-panel-title"><h3>Talk with the pitch agent</h3><p>Voice or text</p></div>',
+                '<div class="pr-panel-title"><h3>Ask the pitch</h3><p>Voice or text</p></div>',
                 unsafe_allow_html=True,
             )
+            st.caption("Demo questions")
+            demo_questions = (
+                ("Problem", "What problem does Pitchroom AI solve?"),
+                ("Audience", "What kind of teams does Pitchroom AI help?"),
+                ("Trust", "How does Pitchroom AI stay trustworthy?"),
+            )
+            demo_question_columns = st.columns(3, gap="small")
+            for column, (label, question_text) in zip(demo_question_columns, demo_questions):
+                with column:
+                    if st.button(label, use_container_width=True, key=f"demo_question_{label}"):
+                        answer_from_question(question_text)
             st.markdown(
                 f'''
                 <div class="pr-record-card">
                     <span class="pr-record-mic">{icon("mic", 24, 1.7)}</span>
-                    <div class="pr-record-copy"><strong>Record a question</strong><span>Whisper transcribes your question, then the agent answers from the source.</span></div>
+                    <div class="pr-record-copy"><strong>Record a question</strong><span>Pitchroom transcribes your question, answers from the source, and speaks the result back.</span></div>
                 </div>
                 ''',
                 unsafe_allow_html=True,
@@ -958,21 +1218,21 @@ else:
                         unsafe_allow_html=True,
                     )
 
-            st.markdown('<div class="pr-field-label">Ask the pitch</div>', unsafe_allow_html=True)
-            question = st.text_area(
-                "Ask the pitch",
-                placeholder="What problem does this product solve?",
-                height=104,
-                label_visibility="collapsed",
-                key="typed_question",
-            )
-            if st.button(
-                "Answer from source",
-                use_container_width=True,
-                disabled=not question.strip(),
-                key="answer_from_source",
-            ):
-                answer_from_question(question)
+            with st.form("typed_question_form", clear_on_submit=True):
+                st.markdown('<div class="pr-field-label">Ask the pitch</div>', unsafe_allow_html=True)
+                question = st.text_area(
+                    "Ask the pitch",
+                    placeholder="What problem does Pitchroom solve?",
+                    height=104,
+                    label_visibility="collapsed",
+                    key="typed_question",
+                )
+                submitted_question = st.form_submit_button("Answer from source", use_container_width=True)
+            if submitted_question:
+                if question.strip():
+                    answer_from_question(question)
+                else:
+                    st.warning("Ask a question first.")
 
             answer = st.session_state.answer
             if answer:
@@ -1000,6 +1260,7 @@ else:
                             st.session_state.answer_audio = speak_response.content
                             st.session_state.answer_audio_format = response_audio_format(speak_response, "audio/mpeg")
                             st.session_state.answer_audio_error = None
+                            st.session_state.answer_audio_autoplay = False
                         else:
                             st.session_state.answer_audio_error = response_detail(speak_response)
                     except (requests.RequestException, TypeError, ValueError) as exc:
@@ -1008,10 +1269,10 @@ else:
                     st.audio(
                         st.session_state.answer_audio,
                         format=st.session_state.answer_audio_format or "audio/wav",
-                        autoplay=False,
+                        autoplay=st.session_state.answer_audio_autoplay,
                     )
                 elif st.session_state.answer_audio_error:
-                    st.info("Answer ready. Add a speech provider in .env to enable audio playback.")
+                    st.warning(f"Answer ready, but spoken playback was unavailable: {st.session_state.answer_audio_error}")
                 with st.expander("View source sections"):
                     for index, source_section in enumerate(answer["sources"], start=1):
                         st.markdown(f"**{index}.** {escape(str(source_section))}")

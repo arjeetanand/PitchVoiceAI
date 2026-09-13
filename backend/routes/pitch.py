@@ -20,6 +20,8 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from config import setting as _setting
+
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DOCUMENT = BACKEND_DIR / "data" / "pitch.txt"
@@ -44,10 +46,6 @@ KOKORO_WARMUP_TEXT = "Pitchroom is ready to answer the next presentation questio
 _kokoro_lock = RLock()
 _kokoro_warmed: set[tuple[str, str, str, float, str]] = set()
 router = APIRouter()
-
-
-def _setting(name: str, default: str) -> str:
-    return os.getenv(name, default).strip()
 
 
 def _document_path() -> Path:

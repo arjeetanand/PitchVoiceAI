@@ -7,7 +7,6 @@ FastAPI service for reading an approved pitch document aloud and answering quest
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
-$env:PITCH_DOCUMENT_PATH = ".\data\pitch.txt"
 python -m uvicorn app:app --reload
 ```
 
@@ -69,7 +68,13 @@ Then set `TTS_PROVIDER=piper` and `PIPER_TTS_URL=http://127.0.0.1:5000/synthesiz
 
 Set `TTS_PROVIDER=auto` with `SARVAM_API_KEY` to use Sarvam Bulbul for speech output. In `auto` mode, Sarvam is tried first, then configured local Piper, Hugging Face, or OpenAI providers. Kokoro is intentionally excluded from `auto`, so the model is never downloaded unless it is explicitly chosen. The default `TTS_PROVIDER=browser` keeps the demo free: the shipped browser room uses its built-in SpeechSynthesis voice when no server TTS is selected, so a presentation can speak without Sarvam. Hugging Face Whisper handles speech-to-text. Source-grounded extractive answers are the default; set `ANSWER_GENERATION_PROVIDER=huggingface` only to opt into hosted answer generation. Without provider keys, extractive Q&A still works and the browser handles reply speech locally.
 
-The repository root `.env` is loaded automatically when the backend starts. Fill in `HUGGINGFACE_API_TOKEN` there before using voice conversations. `FRONTEND_ORIGINS` is only needed if a separate frontend origin will call the API; the shipped live room uses the same origin. Use a non-sensitive demo source because configured providers receive audio and text needed to process a voice turn.
+The repository-root `.env` is loaded automatically when the backend starts.
+Use the categorized root [`.env.example`](../.env.example) as the only setup
+reference. Fill in `HUGGINGFACE_API_TOKEN` there before using microphone
+transcription. `FRONTEND_ORIGINS` is only needed if a separate frontend origin
+will call the API; the shipped live room uses the same origin. Use a
+non-sensitive demo source because configured providers receive audio and text
+needed to process a voice turn.
 
 ## Tests
 

@@ -1,13 +1,13 @@
-import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+from config import load_environment, setting
+
+load_environment()
 
 from routes.pitch import router, store
 
@@ -15,7 +15,7 @@ from routes.pitch import router, store
 app = FastAPI(title="Pitchroom AI API", version="1.0.0")
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+    for origin in setting("FRONTEND_ORIGINS").split(",")
     if origin.strip()
 ]
 app.add_middleware(
