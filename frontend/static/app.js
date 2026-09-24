@@ -25,6 +25,13 @@ const elements = {
   voiceReadiness: document.querySelector("#voice-readiness"),
   liveAnnouncement: document.querySelector("#live-announcement"),
   voiceError: document.querySelector("#voice-error"),
+  agentTraceStatus: document.querySelector("#agent-trace-status"),
+  heroAgentState: document.querySelector("#hero-agent-state"),
+  heroSourceStatus: document.querySelector("#hero-source-status"),
+  heroConsoleReady: document.querySelector(".hero-console-ready"),
+  sourcePeek: document.querySelector("#source-peek"),
+  sourcePeekCitation: document.querySelector("#source-peek-citation"),
+  sourcePeekText: document.querySelector("#source-peek-text"),
   heard: document.querySelector("#heard-question"),
   answer: document.querySelector("#answer-copy"),
   groundingBadge: document.querySelector("#grounding-badge"),
@@ -39,6 +46,7 @@ const elements = {
   demoResetSource: document.querySelector("#demo-reset-source"),
   textQuestionForm: document.querySelector("#text-question-form"),
   textQuestion: document.querySelector("#text-question"),
+  askButton: document.querySelector('#text-question-form button[type="submit"]'),
   playAnswer: document.querySelector("#play-answer"),
   flowHeard: document.querySelector("#flow-heard"),
   flowSource: document.querySelector("#flow-source"),
@@ -79,7 +87,10 @@ const state = {
   turnEpoch: 0,
   lastAnswer: "",
   pendingAbort: null,
+  typedAbort: null,
+  sourceSwitching: false,
   speechWarmPromise: null,
+  speechProvider: null,
 };
 
 const phaseCopy = {
@@ -101,10 +112,16 @@ const phaseCopy = {
     copy: "Pitchroom detects the end of your question after a short pause—there is no stop button for each turn.",
     hint: "Live microphone · end session at any time",
   },
+  transcribing: {
+    label: "Transcribing",
+    title: "Turning your question into text.",
+    copy: "Pitchroom is checking what it heard before searching the approved source.",
+    hint: "Your next turn will re-arm automatically.",
+  },
   thinking: {
     label: "Finding source evidence",
     title: "Checking the approved source.",
-    copy: "Pitchroom is transcribing your question, then finding the strongest supporting sentences before it responds.",
+    copy: "Pitchroom is finding the strongest supporting sentences before it responds.",
     hint: "Your next turn will re-arm automatically.",
   },
   speaking: {
@@ -132,6 +149,8 @@ function setPhase(phase, announcement = "") {
   elements.stageTitle.textContent = copy.title;
   elements.stageCopy.textContent = copy.copy;
   elements.liveHint.textContent = copy.hint;
+  if (elements.agentTraceStatus) elements.agentTraceStatus.textContent = copy.label;
+  if (elements.heroAgentState) elements.heroAgentState.textContent = copy.label;
   const isActive = state.active;
   const buttonText = isActive ? "End live session" : "Start live session";
   elements.liveToggleLabels.forEach((label) => {
@@ -146,11 +165,12 @@ function setPhase(phase, announcement = "") {
 }
 
 function updateFlow() {
-  const current = state.phase === "thinking" ? 2 : state.phase === "speaking" ? 3 : state.lastAnswer ? 3 : 1;
+  const inNewTurn = state.phase === "transcribing" || state.phase === "thinking" || (state.phase === "listening" && state.hasSpoken);
+  const current = state.phase === "thinking" ? 2 : state.phase === "speaking" || (!inNewTurn && state.lastAnswer) ? 3 : 1;
   const steps = [elements.flowHeard, elements.flowSource, elements.flowAnswer];
   steps.forEach((step, index) => {
     step.classList.toggle("is-current", index + 1 === current);
-    step.classList.toggle("is-complete", index + 1 < current || (index + 1 === 3 && Boolean(state.lastAnswer)));
+    step.classList.toggle("is-complete", index + 1 < current || (index + 1 === 3 && Boolean(state.lastAnswer) && !inNewTurn));
   });
 }
 
@@ -163,6 +183,16 @@ function showError(message, keepSession = false) {
 function clearError() {
   elements.voiceError.hidden = true;
   elements.voiceError.textContent = "";
+}
+
+function setSourceSwitching(switching) {
+  state.sourceSwitching = switching;
+  elements.askButton.disabled = switching || Boolean(state.typedAbort);
+  elements.liveToggles.forEach((toggle) => { toggle.disabled = switching; });
+  elements.questionPrompts.forEach((prompt) => { prompt.disabled = switching; });
+  elements.demoReset.disabled = switching;
+  elements.demoResetSource.disabled = switching;
+  elements.sourceUpload.disabled = switching;
 }
 
 function responseDetail(payload, fallback) {
@@ -187,6 +217,9 @@ function setAnswerPlaceholder() {
   elements.playAnswer.hidden = true;
   elements.evidenceStatus.textContent = "Load a question to see the exact source section used.";
   elements.evidenceList.innerHTML = '<p class="empty-evidence">No answer yet. Pitchroom will show the source sentences behind each grounded response.</p>';
+  if (elements.sourcePeek) elements.sourcePeek.hidden = true;
+  if (elements.sourcePeekCitation) elements.sourcePeekCitation.textContent = "";
+  if (elements.sourcePeekText) elements.sourcePeekText.textContent = "";
   syncSceneGrounding(null);
   updateFlow();
 }
@@ -212,6 +245,9 @@ function renderAnswer(answerData) {
   elements.groundingBadge.className = `grounding-badge ${grounded ? "is-grounded" : "is-ungrounded"}`;
   const sources = Array.isArray(answerData.sources) ? answerData.sources : [];
   const sourceRefs = Array.isArray(answerData.source_refs) ? answerData.source_refs : [];
+  if (elements.sourcePeek) elements.sourcePeek.hidden = !sources.length;
+  if (elements.sourcePeekCitation) elements.sourcePeekCitation.textContent = sources.length ? (sourceRefs[0]?.citation || "Source section") : "";
+  if (elements.sourcePeekText) elements.sourcePeekText.textContent = sources.length ? (sourceRefs[0]?.text || sources[0]) : "";
   if (sources.length) {
     elements.evidenceStatus.textContent = `${sources.length} source section${sources.length === 1 ? "" : "s"} used for this response.`;
     elements.evidenceList.innerHTML = "";
@@ -264,14 +300,17 @@ async function loadPitch() {
   elements.sourceExcerpt.textContent = sections.length
     ? sections.map((section) => `${section.citation || "Source section"}\n${section.text || ""}`).join("\n\n")
     : (pitch.text || "No approved source is loaded.");
+  if (elements.heroSourceStatus) elements.heroSourceStatus.textContent = "Source connected";
+  if (elements.heroConsoleReady) elements.heroConsoleReady.dataset.state = "ready";
   return pitch;
 }
 
 async function resetDemo() {
+  if (state.sourceSwitching) return;
+  setSourceSwitching(true);
   clearError();
-  if (state.active) stopLiveSession();
-  elements.demoReset.disabled = true;
-  elements.demoResetSource.disabled = true;
+  state.typedAbort?.abort();
+  if (state.active || state.phase === "arming") stopLiveSession();
   try {
     await getJson("/api/pitch/demo", { method: "POST" });
     await loadPitch();
@@ -280,17 +319,22 @@ async function resetDemo() {
     elements.heard.classList.add("placeholder");
     elements.liveAnnouncement.textContent = "The included demo source has been restored.";
   } catch (error) {
+    if (elements.heroConsoleReady?.dataset.state !== "ready") {
+      if (elements.heroSourceStatus) elements.heroSourceStatus.textContent = "Source unavailable";
+      if (elements.heroConsoleReady) elements.heroConsoleReady.dataset.state = "error";
+    }
     showError(`Could not restore the demo source: ${error.message}`);
   } finally {
-    elements.demoReset.disabled = false;
-    elements.demoResetSource.disabled = false;
+    setSourceSwitching(false);
   }
 }
 
 async function uploadPitch(file) {
-  if (!file) return;
+  if (!file || state.sourceSwitching) return;
+  setSourceSwitching(true);
   clearError();
-  if (state.active) stopLiveSession();
+  state.typedAbort?.abort();
+  if (state.active || state.phase === "arming") stopLiveSession();
   try {
     const formData = new FormData();
     formData.append("file", file, file.name);
@@ -301,8 +345,13 @@ async function uploadPitch(file) {
     elements.heard.classList.add("placeholder");
     elements.liveAnnouncement.textContent = `${file.name} is now the approved source.`;
   } catch (error) {
+    if (elements.heroConsoleReady?.dataset.state !== "ready") {
+      if (elements.heroSourceStatus) elements.heroSourceStatus.textContent = "Source unavailable";
+      if (elements.heroConsoleReady) elements.heroConsoleReady.dataset.state = "error";
+    }
     showError(`Could not load this pitch: ${error.message}`);
   } finally {
+    setSourceSwitching(false);
     elements.sourceUpload.value = "";
   }
 }
@@ -379,7 +428,7 @@ function startRecorder(mode = "live") {
       capture.accepted
       && state.active
       && capture.sessionId === state.sessionId
-      && state.phase === "thinking"
+      && state.phase === "transcribing"
       && state.hasSpoken
       && blob.size > 400
     ) {
@@ -424,7 +473,7 @@ function startRecorder(mode = "live") {
 
 function finishDetectedTurn(reason) {
   if (!state.recorder || state.recorder.state === "inactive" || !state.recorderContext?.accepted || !state.hasSpoken) return;
-  setPhase("thinking", reason === "limit" ? "Maximum live-turn length reached. Finding source evidence now." : "Pause detected. Finding source evidence now.");
+  setPhase("transcribing", reason === "limit" ? "Maximum live-turn length reached. Transcribing now." : "Pause detected. Transcribing your question now.");
   state.recorder.stop();
 }
 
@@ -551,6 +600,7 @@ function analyseMicrophone() {
           state.hasSpoken = true;
           state.turnStartedAt = now;
           state.silenceStartedAt = 0;
+          updateFlow();
           elements.stageTitle.textContent = "Listening to your question…";
           elements.stageCopy.textContent = "Keep speaking naturally. A brief pause will send this turn automatically.";
           elements.liveAnnouncement.textContent = "Speech detected. Pitchroom is listening to your question.";
@@ -568,8 +618,8 @@ function analyseMicrophone() {
     } else {
       if (!state.silenceStartedAt) state.silenceStartedAt = now;
       if (now - state.silenceStartedAt >= END_OF_TURN_MS) finishDetectedTurn("silence");
-      if (state.turnStartedAt && now - state.turnStartedAt >= MAX_TURN_MS) finishDetectedTurn("limit");
     }
+    if (state.hasSpoken && state.turnStartedAt && now - state.turnStartedAt >= MAX_TURN_MS) finishDetectedTurn("limit");
   }
   state.meterFrame = requestAnimationFrame(analyseMicrophone);
 }
@@ -578,6 +628,7 @@ function armNextTurn(announcement = "Pitchroom is listening again.", retainNotic
   if (!state.active || !state.stream) return;
   if (!retainNotice) clearError();
   disarmBargeCapture();
+  state.hasSpoken = false;
   state.calibrationUntil = performance.now() + Math.min(420, CALIBRATION_MS);
   setPhase("listening", announcement);
   if (!startRecorder()) {
@@ -588,26 +639,35 @@ function armNextTurn(announcement = "Pitchroom is listening again.", retainNotic
 }
 
 async function startLiveSession() {
+  if (state.sourceSwitching) return;
   if (state.active) {
     stopLiveSession();
     return;
   }
+  if (state.phase === "arming") return;
   clearError();
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder || !(window.AudioContext || window.webkitAudioContext)) {
     showError("This browser does not support live microphone capture. Use the typed source question instead.");
     return;
   }
+  state.typedAbort?.abort();
   setPhase("arming", "Requesting microphone permission.");
+  let sessionId = state.sessionId;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    if (sessionId !== state.sessionId) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     state.active = true;
-    state.sessionId += 1;
+    sessionId = ++state.sessionId;
     state.stream = stream;
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     state.audioContext = new AudioContextClass();
     await state.audioContext.resume();
+    if (!state.active || sessionId !== state.sessionId) return;
     const source = state.audioContext.createMediaStreamSource(stream);
     const analyser = state.audioContext.createAnalyser();
     analyser.fftSize = 2048;
@@ -621,6 +681,8 @@ async function startLiveSession() {
     armNextTurn("Microphone connected. Pitchroom is listening.");
     state.meterFrame = requestAnimationFrame(analyseMicrophone);
   } catch (error) {
+    if (sessionId !== state.sessionId) return;
+    if (state.active) stopLiveSession();
     const denied = error && (error.name === "NotAllowedError" || error.name === "SecurityError");
     showError(denied ? "Microphone access was not allowed. Allow it in browser settings, then start the session again." : `Could not start the microphone: ${error.message || "Unknown error."}`);
   }
@@ -699,6 +761,7 @@ function warmSpeechProvider() {
         setVoiceReadiness("Studio voice unavailable — browser voice will take over.", "fallback");
         return false;
       }
+      state.speechProvider = readiness.provider || null;
       if (readiness.provider === "kokoro" && readiness.ready) {
         setVoiceReadiness("Studio voice ready · local English", "ready");
         return true;
@@ -780,6 +843,9 @@ function playBrowserSpeech(text, resumeWhenFinished) {
 }
 
 async function playAnswer(text, resumeWhenFinished, signal) {
+  await warmSpeechProvider();
+  if (signal?.aborted) throw new DOMException("The speech request was aborted.", "AbortError");
+  if (state.speechProvider === "browser") return playBrowserSpeech(text, resumeWhenFinished);
   try {
     const speechBlob = await requestSpeech(text, signal);
     if (signal?.aborted) throw new DOMException("The speech request was aborted.", "AbortError");
@@ -846,6 +912,7 @@ async function processVoiceTurn(blob, sessionId, turnEpoch) {
     const question = String(transcription.text || "").trim();
     if (!question) throw new Error("No speech was detected. Try asking your question again.");
     setHeard(question);
+    setPhase("thinking", "Question transcribed. Finding source evidence now.");
     const answerData = await requestAnswer(question, controller.signal);
     if (!state.active || sessionId !== state.sessionId || turnEpoch !== state.turnEpoch) return;
     renderAnswer(answerData);
@@ -871,6 +938,7 @@ async function processVoiceTurn(blob, sessionId, turnEpoch) {
 
 async function askTypedQuestion(event) {
   event.preventDefault();
+  if (elements.textQuestion.disabled || state.sourceSwitching) return;
   const question = elements.textQuestion.value.trim();
   if (question.length < 2) {
     elements.textQuestion.focus();
@@ -895,17 +963,24 @@ async function askTypedQuestion(event) {
   setHeard(question);
   setPhase("thinking", "Finding source evidence for the typed question.");
   elements.textQuestion.disabled = true;
+  elements.askButton.disabled = true;
+  const controller = new AbortController();
+  state.typedAbort = controller;
   try {
-    const answerData = await requestAnswer(question);
+    const answerData = await requestAnswer(question, controller.signal);
+    if (controller.signal.aborted) return;
     renderAnswer(answerData);
     elements.textQuestion.value = "";
     if (wasActive) armNextTurn("Typed answer ready. Pitchroom is listening again.");
     else setPhase("ready", "Grounded answer ready.");
   } catch (error) {
+    if (error.name === "AbortError" || controller.signal.aborted) return;
     showError(`Could not answer this question: ${error.message}`, wasActive);
     if (wasActive) armNextTurn("Pitchroom is listening again.");
   } finally {
+    if (state.typedAbort === controller) state.typedAbort = null;
     elements.textQuestion.disabled = false;
+    elements.askButton.disabled = Boolean(state.sourceSwitching);
   }
 }
 
@@ -975,11 +1050,15 @@ function bindEvents() {
       const question = String(prompt.dataset.question || "").trim();
       if (!question) return;
       elements.textQuestion.value = question;
-      document.querySelector("#live-stage")?.scrollIntoView({
+      const askNow = prompt.hasAttribute("data-ask-now");
+      const target = askNow && window.matchMedia("(max-width: 880px)").matches
+        ? document.querySelector(".conversation-card") : document.querySelector("#live-stage");
+      target?.scrollIntoView({
         behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
         block: "start",
       });
-      window.setTimeout(() => elements.textQuestion.focus(), 420);
+      if (askNow) elements.textQuestionForm.requestSubmit();
+      else window.setTimeout(() => elements.textQuestion.focus(), 420);
     });
   });
   window.addEventListener("beforeunload", stopLiveSession);
@@ -993,6 +1072,8 @@ async function initialise() {
   try {
     await loadPitch();
   } catch (error) {
+    if (elements.heroSourceStatus) elements.heroSourceStatus.textContent = "Source unavailable";
+    if (elements.heroConsoleReady) elements.heroConsoleReady.dataset.state = "error";
     showError(`Could not load the approved source: ${error.message}`);
   }
   setAnswerPlaceholder();

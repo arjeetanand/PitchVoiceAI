@@ -133,6 +133,7 @@ The format support, trust boundary, and production path are in
 .venv/bin/python -m pytest backend -q
 node --check frontend/static/app.js
 node --check frontend/static/scene.js
+node --test frontend/test_e2e.mjs # local Chrome required
 ```
 
 ## Deployment
