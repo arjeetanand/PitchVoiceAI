@@ -13,8 +13,11 @@ DEFAULT_MAX_CHARS = 50_000
 
 def _limit_worker_resources() -> None:
     if not sys.platform.startswith("linux"):
-        return
+        raise ValueError("PDF uploads require Linux process memory limits.")
     import resource
+
+    if not hasattr(resource, "RLIMIT_AS"):
+        raise ValueError("PDF uploads require Linux process memory limits.")
 
     for name, requested in (("RLIMIT_AS", 256 * 1024 * 1024), ("RLIMIT_CPU", 20)):
         limit = getattr(resource, name, None)
@@ -74,8 +77,8 @@ def _extract(payload: bytes, max_chars: int) -> dict:
 
 
 def _main() -> None:
-    _limit_worker_resources()
     try:
+        _limit_worker_resources()
         max_bytes = int(sys.argv[1]) if len(sys.argv) > 1 else MAX_PDF_BYTES
         max_chars = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_MAX_CHARS
         payload = sys.stdin.buffer.read(max_bytes + 1)

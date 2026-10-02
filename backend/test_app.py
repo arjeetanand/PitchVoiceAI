@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import sys
 import wave
 import zipfile
 
@@ -11,15 +12,21 @@ import numpy as np
 import pymupdf
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("PITCHROOM_ACCESS_TOKEN", "test-only-access-token")
+if not os.environ.get("PITCHROOM_ACCESS_TOKEN"):
+    os.environ["PITCHROOM_ACCESS_TOKEN"] = "test-only-access-token"
 import app
 from routes import pitch as pitch_routes
 
 
+authorization = base64.b64encode(
+    f"presenter:{os.environ['PITCHROOM_ACCESS_TOKEN']}".encode("utf-8")
+).decode("ascii")
 client = TestClient(
     app.app,
-    auth=("presenter", os.environ["PITCHROOM_ACCESS_TOKEN"]),
-    headers={"Origin": "http://127.0.0.1:8501"},
+    headers={
+        "Authorization": f"Basic {authorization}",
+        "Origin": "http://127.0.0.1:8501",
+    },
 )
 
 
@@ -37,6 +44,27 @@ def test_root_serves_the_live_pitchroom_interface() -> None:
     assert response.status_code == 200
     assert "Pitchroom AI" in response.text
     assert "/static/app.js" in response.text
+
+
+def test_unauthenticated_clients_cannot_read_or_replace_the_shared_pitch() -> None:
+    original = "Private rehearsal source."
+    app.store.replace(original, "private.txt")
+    anonymous = TestClient(app.app)
+
+    assert anonymous.get("/api/pitch").status_code == 401
+    assert anonymous.post(
+        "/api/pitch/document",
+        json={"document": "attacker source"},
+    ).status_code == 401
+    assert anonymous.post(
+        "/api/pitch/file",
+        files={"file": ("pitch.txt", b"attacker source", "text/plain")},
+    ).status_code == 401
+    assert anonymous.post(
+        "/api/voice/transcribe",
+        files={"file": ("question.wav", b"RIFF", "audio/wav")},
+    ).status_code == 401
+    assert app.store.text == original
 
 
 def test_document_upload_and_grounded_answer() -> None:
@@ -165,7 +193,7 @@ def test_retrieval_ignores_question_fillers_when_finding_file_support() -> None:
     assert "PPTX" in response.json()["answer"]
 
 
-def test_pdf_upload_extracts_text() -> None:
+def test_pdf_upload_obeys_platform_resource_policy() -> None:
     document = pymupdf.open()
     page = document.new_page()
     page.insert_text((72, 72), "The pitch supports customer demos.")
@@ -176,6 +204,11 @@ def test_pdf_upload_extracts_text() -> None:
         "/api/pitch/file",
         files={"file": ("pitch.pdf", pdf_bytes, "application/pdf")},
     )
+
+    if not sys.platform.startswith("linux"):
+        assert response.status_code == 400
+        assert "require Linux" in response.json()["detail"]
+        return
 
     assert response.status_code == 200
     pitch = client.get("/api/pitch").json()
@@ -240,6 +273,23 @@ def test_document_upload_enforces_the_configured_size_limit(monkeypatch) -> None
 
     assert response.status_code == 413
     assert "at most 4 bytes" in response.json()["detail"]
+
+
+def test_text_upload_rejects_oversized_input_before_splitting(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_DOCUMENT_CHARS", "4")
+    monkeypatch.setattr(
+        pitch_routes,
+        "_sentence_parts",
+        lambda value: (_ for _ in ()).throw(AssertionError("oversized text was split")),
+    )
+
+    response = client.post(
+        "/api/pitch/file",
+        files={"file": ("pitch.txt", b"12345", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    assert "character limit" in response.json()["detail"]
 
 
 def test_markdown_upload_accepts_generic_content_type() -> None:
@@ -673,6 +723,55 @@ def test_transcribe_rejects_oversized_audio_upload(monkeypatch) -> None:
 
     assert response.status_code == 413
     assert "at most 4 bytes" in response.json()["detail"]
+
+
+def test_transcription_hourly_limit_stops_before_an_excess_provider_call(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "test-token")
+    monkeypatch.setattr(pitch_routes, "_transcription_times", type(pitch_routes._transcription_times)())
+    monkeypatch.setattr(pitch_routes, "_transcription_hourly_limit", lambda: 1)
+    monkeypatch.setattr(
+        pitch_routes,
+        "_huggingface_transcription",
+        lambda audio, content_type: calls.append((audio, content_type)) or "A founder question.",
+    )
+    upload = {"file": ("question.wav", b"RIFF", "audio/wav")}
+
+    first = client.post("/api/voice/transcribe", files=upload)
+    second = client.post("/api/voice/transcribe", files=upload)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert len(calls) == 1
+
+
+def test_docx_expansion_limit_rejects_before_xml_parsing(monkeypatch) -> None:
+    xml = (
+        b'<w:document xmlns:w="urn:test"><w:p><w:r><w:t>'
+        + b"x" * (pitch_routes.MAX_OFFICE_MEMBER_BYTES + 1)
+        + b"</w:t></w:r></w:p></w:document>"
+    )
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", xml)
+    monkeypatch.setattr(
+        pitch_routes.ElementTree,
+        "fromstring",
+        lambda value: (_ for _ in ()).throw(AssertionError("expanded XML was parsed")),
+    )
+
+    response = client.post(
+        "/api/pitch/file",
+        files={
+            "file": (
+                "pitch.docx",
+                payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 400
 
 
 def test_huggingface_text_accepts_object_response(monkeypatch) -> None:

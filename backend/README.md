@@ -29,7 +29,7 @@ The API runs at `http://localhost:8000` when launched directly. The repository's
 - `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata. All room and API routes require HTTP Basic authentication with username `presenter` and the `PITCHROOM_ACCESS_TOKEN` value.
 - `POST /api/pitch/demo` restores the included Pitchroom demo brief.
 - `POST /api/pitch/document` accepts `{ "document": "..." }`.
-- `POST /api/pitch/file` accepts PPTX, selectable-text PDF, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted in a time-bounded worker with Linux CPU/memory limits; DOCX paragraphs are extracted from OOXML. Export legacy `.ppt` files as `.pptx` or PDF first.
+- `POST /api/pitch/file` accepts PPTX, selectable-text PDF on Linux, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted in a time-bounded worker with Linux CPU/memory limits; DOCX paragraphs are extracted from OOXML. PDF uploads are rejected on other platforms rather than parsed without a memory cap. Export legacy `.ppt` files as `.pptx` or PDF first.
 - `POST /api/voice/answer` accepts `{ "question": "..." }` and returns a grounded answer, source chunks, and `source_refs` such as `Slide 4` or `Page 2`. The frontend can send speech-to-text output here.
 - `POST /api/pitch/read` returns audio for the loaded pitch. Kokoro, Sarvam, Piper, local Hugging Face, and Hugging Face API output WAV; OpenAI output is MP3.
 - `POST /api/voice/speak` accepts `{ "text": "...", "voice": "alloy" }` and returns audio with the correct `Content-Type`.

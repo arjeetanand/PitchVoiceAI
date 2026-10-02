@@ -13,6 +13,7 @@ Pitchroom AI gives founder-led teams a rehearsal space that keeps the approved s
 ## What the prototype does
 
 - Loads PPTX, selectable-text PDF, DOCX, Markdown, and plain-text pitch documents.
+- Accepts PDF uploads only on Linux, where the extraction worker can enforce memory and CPU limits.
 - Preserves slide/page provenance, including PPTX speaker notes, and shows the
   citation beside each grounded answer.
 - Reports image-only slides/pages as review warnings instead of silently
