@@ -201,11 +201,57 @@ function responseDetail(payload, fallback) {
 }
 
 async function getJson(path, options = {}) {
-  const response = await fetch(path, { headers: { Accept: "application/json", ...(options.headers || {}) }, ...options });
+  const response = await apiFetch(path, {
+    ...options,
+    headers: { Accept: "application/json", ...(options.headers || {}) },
+  });
   let body = null;
   try { body = await response.json(); } catch (_) { /* keep the HTTP error readable below */ }
   if (!response.ok) throw new Error(responseDetail(body, `Request failed (${response.status}).`));
   return body;
+}
+
+const ROOM_TOKEN_KEY = "pitchroom_access_token";
+let roomTokenPrompt = null;
+let roomTokenInMemory = "";
+
+function storedRoomToken() {
+  try { return sessionStorage.getItem(ROOM_TOKEN_KEY) || roomTokenInMemory; } catch (_) { return roomTokenInMemory; }
+}
+
+function saveRoomToken(token) {
+  roomTokenInMemory = token;
+  try {
+    if (token) sessionStorage.setItem(ROOM_TOKEN_KEY, token);
+    else sessionStorage.removeItem(ROOM_TOKEN_KEY);
+  } catch (_) { /* retain this tab's token in memory */ }
+}
+
+function promptForRoomToken() {
+  if (!roomTokenPrompt) {
+    roomTokenPrompt = Promise.resolve(window.prompt("Enter the access token configured for this Pitchroom room."))
+      .then((token) => (token || "").trim())
+      .finally(() => { roomTokenPrompt = null; });
+  }
+  return roomTokenPrompt;
+}
+
+async function apiFetch(path, options = {}) {
+  const send = () => {
+    const headers = new Headers(options.headers || {});
+    const token = storedRoomToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    return fetch(path, { ...options, headers });
+  };
+
+  let response = await send();
+  if (response.status !== 401) return response;
+  const token = await promptForRoomToken();
+  if (!token) return response;
+  saveRoomToken(token);
+  response = await send();
+  if (response.status === 401) saveRoomToken("");
+  return response;
 }
 
 function setAnswerPlaceholder() {
@@ -726,7 +772,7 @@ async function requestAnswer(question, signal) {
 }
 
 async function requestSpeech(text, signal) {
-  const response = await fetch("/api/voice/speak", {
+  const response = await apiFetch("/api/voice/speak", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
@@ -753,7 +799,7 @@ function warmSpeechProvider() {
   // live room never spends provider credits or sends an answer to a provider.
   if (state.speechWarmPromise) return state.speechWarmPromise;
   setVoiceReadiness("Checking the selected voice…");
-  state.speechWarmPromise = fetch("/api/voice/warm", { method: "POST" })
+  state.speechWarmPromise = apiFetch("/api/voice/warm", { method: "POST" })
     .then(async (response) => {
       let readiness = {};
       try { readiness = await response.json(); } catch (_) { /* retain fallback below */ }

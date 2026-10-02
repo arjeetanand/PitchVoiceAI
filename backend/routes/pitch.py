@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import io
 import base64
@@ -10,6 +11,7 @@ import shutil
 import sys
 import subprocess
 import tempfile
+from collections import deque
 import urllib.error
 import urllib.request
 import wave
@@ -17,7 +19,8 @@ import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
+from time import monotonic
 from typing import Any
 from xml.etree import ElementTree
 
@@ -46,6 +49,9 @@ AUDIO_UPLOAD_EXTENSIONS = {
 AUDIO_UPLOAD_VIDEO_TYPES = {"video/mp4", "video/webm"}
 DEFAULT_MAX_AUDIO_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
+MAX_OOXML_MEMBER_BYTES = 8 * 1024 * 1024
+MAX_OOXML_DOCUMENT_BYTES = 32 * 1024 * 1024
+MAX_TRANSCRIPTIONS_PER_MINUTE = 12
 KOKORO_SAMPLE_RATE = 24_000
 KOKORO_MODEL_REPO = "hexgrad/Kokoro-82M"
 MAX_KOKORO_TEXT_CHARS = 1_200
@@ -79,6 +85,9 @@ XML_NS = {
 }
 _kokoro_lock = RLock()
 _kokoro_warmed: set[tuple[str, str, str, float, str]] = set()
+# ponytail: one room-wide process slot and rate window; per-room buckets if multi-room support lands.
+_transcription_lock = Lock()
+_transcription_starts: deque[float] = deque()
 router = APIRouter()
 
 
@@ -223,17 +232,27 @@ def _xml_paragraphs(payload: bytes, namespace: str) -> list[str]:
     return paragraphs
 
 
-def _zip_member(archive: zipfile.ZipFile, name: str) -> bytes:
+def _zip_member(archive: zipfile.ZipFile, name: str, max_bytes: int) -> bytes:
     try:
-        return archive.read(name)
+        member_info = archive.getinfo(name)
     except KeyError as exc:
         raise ValueError(f"The Office document is missing {name}.") from exc
+    if member_info.file_size > max_bytes:
+        raise ValueError("The Office document exceeds safe XML extraction limits.")
+    with archive.open(member_info) as member:
+        payload = member.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("The Office document exceeds safe XML extraction limits.")
+    return payload
 
 
 def _extract_docx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            paragraphs = _xml_paragraphs(_zip_member(archive, "word/document.xml"), XML_NS["w"])
+            paragraphs = _xml_paragraphs(
+                _zip_member(archive, "word/document.xml", MAX_OOXML_MEMBER_BYTES),
+                XML_NS["w"],
+            )
             image_count = sum(1 for name in archive.namelist() if name.startswith("word/media/"))
     except (zipfile.BadZipFile, ValueError) as exc:
         raise ValueError("This DOCX file could not be opened.") from exc
@@ -275,11 +294,19 @@ def _extract_pptx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
             media_count = sum(1 for name in archive.namelist() if name.startswith("ppt/media/"))
             sections: list[SourceSection] = []
             empty_slides: list[int] = []
+            remaining_bytes = MAX_OOXML_DOCUMENT_BYTES
             for name in slide_names:
                 slide_index = _slide_number(name)
-                paragraphs = _xml_paragraphs(_zip_member(archive, name), XML_NS["a"])
+                slide_xml = _zip_member(archive, name, min(MAX_OOXML_MEMBER_BYTES, remaining_bytes))
+                remaining_bytes -= len(slide_xml)
+                paragraphs = _xml_paragraphs(slide_xml, XML_NS["a"])
                 notes_name = note_names.get(slide_index)
-                notes = _xml_paragraphs(_zip_member(archive, notes_name), XML_NS["a"]) if notes_name else []
+                if notes_name:
+                    notes_xml = _zip_member(archive, notes_name, min(MAX_OOXML_MEMBER_BYTES, remaining_bytes))
+                    remaining_bytes -= len(notes_xml)
+                    notes = _xml_paragraphs(notes_xml, XML_NS["a"])
+                else:
+                    notes = []
                 body = " ".join(paragraphs)
                 if notes:
                     body = f"{body} Speaker notes: {' '.join(notes)}".strip()
@@ -1000,6 +1027,23 @@ def _huggingface_transcription(audio: bytes, content_type: str) -> str:
     return text
 
 
+async def _transcribe_with_slot(audio: bytes, content_type: str) -> str:
+    try:
+        return await asyncio.to_thread(_huggingface_transcription, audio, content_type)
+    finally:
+        _transcription_lock.release()
+
+
+def _take_transcription_budget() -> bool:
+    now = monotonic()
+    while _transcription_starts and now - _transcription_starts[0] >= 60:
+        _transcription_starts.popleft()
+    if len(_transcription_starts) >= MAX_TRANSCRIPTIONS_PER_MINUTE:
+        return False
+    _transcription_starts.append(now)
+    return True
+
+
 def _speech_audio(text: str, voice: str | None = None) -> tuple[bytes, str]:
     preference = _tts_provider_preference()
     if preference == "browser":
@@ -1078,18 +1122,7 @@ def _speech_provider() -> str:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "document_loaded": bool(store.text),
-        "document_source": store.source,
-        "document_metadata": store.metadata,
-        "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
-        "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
-        "kokoro_selected": _tts_provider_preference() == "kokoro",
-        "piper_configured": bool(_setting("PIPER_TTS_URL", "")),
-        "openai_configured": bool(_setting("OPENAI_API_KEY", "")),
-        "speech_provider": _speech_provider(),
-    }
+    return {"status": "ok"}
 
 
 @router.get("/api/pitch")
@@ -1204,8 +1237,18 @@ async def transcribe_audio(file: UploadFile = File(...)) -> dict[str, str]:
     audio = await _read_limited_audio_upload(file, _audio_upload_limit())
     if not _setting("HUGGINGFACE_API_TOKEN", ""):
         raise HTTPException(status_code=503, detail="Set HUGGINGFACE_API_TOKEN in .env to transcribe audio.")
+    if not _transcription_lock.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="A transcription is already processing. Try again shortly.")
+    if not _take_transcription_budget():
+        _transcription_lock.release()
+        raise HTTPException(status_code=429, detail="The room has reached its transcription limit. Try again shortly.")
+    worker = asyncio.create_task(_transcribe_with_slot(audio, _audio_content_type(file)))
     try:
-        text = _huggingface_transcription(audio, _audio_content_type(file))
+        # Keep the slot held until the provider call finishes, even if the client disconnects.
+        text = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        worker.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"text": text, "provider": "huggingface"}
