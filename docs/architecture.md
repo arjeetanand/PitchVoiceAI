@@ -22,8 +22,9 @@ FastAPI (backend/)
 | Area | Responsibility |
 | --- | --- |
 | `frontend/static/` | Light presentation interface, shader-backed 3D particle field, browser microphone lifecycle, adaptive silence detection, source evidence, typed fallback, and audio playback. |
+| `backend/app.py` | Requires the shared presenter password, checks browser origins for writes, and caps request bodies before FastAPI parses them. |
 | `backend/config.py` | Loads the single repository-root `.env` and owns the supported setting names and safe defaults. |
-| `backend/routes/pitch.py` | Extracts document content, preserves slide/page provenance, selects relevant source chunks, and provides Q&A and audio endpoints. |
+| `backend/routes/pitch.py` | Bounds document extraction, preserves slide/page provenance, selects relevant source chunks, and provides Q&A and audio endpoints. |
 | `backend/data/pitch.txt` | Verified demo brief used by the one-click demo path. |
 | `run-dev.sh` | Starts the same-origin FastAPI application on port 8501 by default. |
 | `render-start.sh` | Starts one public FastAPI process on Render's assigned port. |
@@ -38,6 +39,8 @@ FastAPI (backend/)
 ## Operational notes
 
 - API credentials live only in the root `.env` file or deployment secret environment variables; supported names and defaults are documented in the root `.env.example` and `backend/config.py`.
+- The room and APIs use one shared HTTP Basic password (`PITCHROOM_ACCESS_TOKEN`) for the presenter; this is not per-user or per-workspace access control. `/health` is anonymous and returns only service status.
+- Upload bodies, text/section counts, PDF pages and parsing time/memory, Office archive expansion, and upload concurrency have ceilings. PDF CPU/memory caps apply on Linux; legacy `.ppt` conversion is disabled, so export to `.pptx` or PDF.
 - The active document is in-memory; it resets when the API restarts. Persistent per-user document storage is a future extension.
 - The source text and recorded audio leave the app when a configured third-party transcription or speech provider processes them. Use an approved non-sensitive demo source.
 - Set `TTS_PROVIDER=browser` for a no-key presentation: reply text stays in the browser and is spoken by the device voice. Set `TTS_PROVIDER=kokoro` for the preferred local 24 kHz English studio voice; the FastAPI process caches its fixed official model and selected narrator after the page warms it. Kokoro is bounded to short live replies so a document read cannot monopolize the local model. Set `TTS_PROVIDER=piper` with `PIPER_TTS_URL` for a smaller local neural fallback; Piper is an optional separate process.

@@ -22,7 +22,7 @@ Say:
 Do not say:
 
 - “It understands every chart, screenshot, or scanned slide automatically.”
-- “It has multi-user storage, authentication, or production privacy controls.”
+- “It has multi-user storage, per-user accounts, or production privacy controls.”
 - “It provides real-time streaming conversation.”
 
 ## Two-minute presentation
@@ -61,7 +61,8 @@ Close with: “Pitchroom AI helps a founder enter the room prepared, consistent,
 
 Run this 10 minutes before judging:
 
-1. Start the app and verify that `pitch.txt` appears as the approved source.
+1. Start the app, sign in with username `presenter` and the configured shared
+   password, and verify that `pitch.txt` appears as the approved source.
 2. Select **Use demo brief** to reset the pitch.
 3. Ask the first demo question by text and verify source evidence appears.
 4. Start one live session in the browser you will present from.
