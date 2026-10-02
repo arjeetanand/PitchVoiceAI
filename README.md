@@ -33,8 +33,13 @@ The experience is seamless turn-taking, not streaming transcription: a presenter
 python3 -m venv .venv
 .venv/bin/python -m pip install -r backend/requirements-kokoro.txt
 cp .env.example .env
-./run-dev.sh
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
+
+Copy the generated value into `.env` as `PITCHROOM_ACCESS_TOKEN`, then run
+`./run-dev.sh`. The browser prompts for username `presenter` and that password.
+The room uses one shared password; it does not provide per-user accounts or
+workspace isolation.
 
 The Kokoro requirements are the recommended presentation install. They include
 the base API dependencies and the local studio voice. If you only need typed
@@ -46,8 +51,8 @@ brief loads automatically. Use **Start live session** once, ask naturally, and
 pause to send the question. The reply stops if you speak over it, and the same
 session listens for the next question automatically. Use **Use demo brief** for
 a clean reset, or upload an approved PPTX, PDF, DOCX, Markdown, or TXT file
-for rehearsal. Legacy binary `.ppt` files are converted only when LibreOffice
-is available; exporting to `.pptx` is the reliable path.
+for rehearsal. Export legacy binary `.ppt` files to `.pptx` or PDF before
+uploading; the app does not convert legacy presentations.
 
 ## Configuration
 
@@ -85,6 +90,9 @@ The remaining provider settings are grouped in `.env.example` under runtime,
 speech-to-text, local voice, and hosted voice sections. You do not need to fill
 every key. Typed questions and browser speech work without a provider key;
 live microphone transcription uses the configured Hugging Face Whisper path.
+`MAX_TRANSCRIPTIONS_PER_HOUR` defaults to 30 per application process. The
+in-memory quota resets when the process restarts and is not shared across
+multiple workers.
 
 Kokoro starts warming as the live room opens, loading its model and narrator while the presenter gets ready. On its first install it downloads the public model artifacts from Hugging Face (not your answer text); after that cache is present, answers stay on the presentation machine and the demo can run offline for TTS. For the first launch, wait until the page is fully open before the first question; later answers use the in-memory model. This avoids a provider round trip, but it is not literal streaming audio—keep live answers to one to three sentences for the quickest response. Use `KOKORO_VOICE=af_bella` to audition the alternative high-quality English narrator, then keep one voice consistent for the demo.
 
@@ -138,10 +146,12 @@ node --check frontend/static/scene.js
 ## Deployment
 
 `render.yaml` exposes one FastAPI service that serves both the static live room
-and `/api` from the same public origin. Render uses the free browser voice by
-default, so only `HUGGINGFACE_API_TOKEN` is needed for live speech. Run Kokoro
-locally for the polished in-person presentation voice, or configure another
-server provider only when you intentionally need it. HTTPS is required for
-microphone capture outside local development.
+and `/api` from the same origin. Set `PITCHROOM_ACCESS_TOKEN` and
+`HUGGINGFACE_API_TOKEN` in the Render dashboard before opening the room. Render
+uses the free browser voice by default; Hugging Face is needed for live speech
+transcription. Run Kokoro locally for the polished in-person presentation
+voice, or configure another server provider only when you intentionally need
+it. HTTPS is required for microphone capture and protects the shared password
+in transit.
 
 Before presenting from a deployed service, use a non-sensitive source document, run the microphone check in the target browser, make one automatic-pause voice turn, and verify that a spoken interruption starts a fresh turn.

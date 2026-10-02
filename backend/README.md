@@ -10,6 +10,11 @@ python -m pip install -r requirements.txt
 python -m uvicorn app:app --reload
 ```
 
+Before starting, create the repository-root `.env` from [`.env.example`](../.env.example)
+and set a long random `PITCHROOM_ACCESS_TOKEN`; the service fails closed while
+it is empty. The browser uses HTTP Basic authentication with username
+`presenter` and that shared token.
+
 For local MMS TTS, the requirements install a CPU-only PyTorch build on Linux and a compatible PyPI wheel on macOS/other local platforms:
 
 ```bash
@@ -20,11 +25,11 @@ The API runs at `http://localhost:8000` when launched directly. The repository's
 
 ## Routes
 
-- `GET /health` checks service and document state.
-- `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata.
+- `GET /health` is an anonymous status-only service check; it reports 503 until presenter authentication is configured.
+- `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata. All room and API routes require HTTP Basic authentication with username `presenter` and the `PITCHROOM_ACCESS_TOKEN` value.
 - `POST /api/pitch/demo` restores the included Pitchroom demo brief.
 - `POST /api/pitch/document` accepts `{ "document": "..." }`.
-- `POST /api/pitch/file` accepts PPTX, selectable-text PDF, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted page by page with PyMuPDF; DOCX paragraphs are extracted from OOXML. Legacy `.ppt` files use LibreOffice when it is installed.
+- `POST /api/pitch/file` accepts PPTX, selectable-text PDF, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted in a time-bounded worker with Linux CPU/memory limits; DOCX paragraphs are extracted from OOXML. Export legacy `.ppt` files as `.pptx` or PDF first.
 - `POST /api/voice/answer` accepts `{ "question": "..." }` and returns a grounded answer, source chunks, and `source_refs` such as `Slide 4` or `Page 2`. The frontend can send speech-to-text output here.
 - `POST /api/pitch/read` returns audio for the loaded pitch. Kokoro, Sarvam, Piper, local Hugging Face, and Hugging Face API output WAV; OpenAI output is MP3.
 - `POST /api/voice/speak` accepts `{ "text": "...", "voice": "alloy" }` and returns audio with the correct `Content-Type`.
@@ -70,11 +75,17 @@ Set `TTS_PROVIDER=auto` with `SARVAM_API_KEY` to use Sarvam Bulbul for speech ou
 
 The repository-root `.env` is loaded automatically when the backend starts.
 Use the categorized root [`.env.example`](../.env.example) as the only setup
-reference. Fill in `HUGGINGFACE_API_TOKEN` there before using microphone
-transcription. `FRONTEND_ORIGINS` is only needed if a separate frontend origin
-will call the API; the shipped live room uses the same origin. Use a
-non-sensitive demo source because configured providers receive audio and text
-needed to process a voice turn.
+reference. Set a long random `PITCHROOM_ACCESS_TOKEN` before starting the
+service; an empty value fails closed. The browser asks for username `presenter`
+and that shared password. Also set `HUGGINGFACE_API_TOKEN` before using
+microphone transcription. Unsafe requests must come from an origin listed in
+`FRONTEND_ORIGINS`; the shipped live room uses the same origin. Request bodies,
+uploads, Office archive extraction, PDF pages, and document sections have
+explicit size/count ceilings. Transcription is capped at 30 requests per hour
+per process by default; this in-memory quota resets on restart and is not shared
+across workers. One upload/transcription body is parsed at a time per process.
+Use a non-sensitive demo source because configured providers receive audio and
+text needed to process a voice turn.
 
 Document ingestion is intentionally honest: embedded images, scanned pages, and
 chart-only slides are counted and returned as review warnings. The current

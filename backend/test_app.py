@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import wave
 import zipfile
 
@@ -10,11 +11,16 @@ import numpy as np
 import pymupdf
 from fastapi.testclient import TestClient
 
+os.environ.setdefault("PITCHROOM_ACCESS_TOKEN", "test-only-access-token")
 import app
 from routes import pitch as pitch_routes
 
 
-client = TestClient(app.app)
+client = TestClient(
+    app.app,
+    auth=("presenter", os.environ["PITCHROOM_ACCESS_TOKEN"]),
+    headers={"Origin": "http://127.0.0.1:8501"},
+)
 
 
 def setup_function() -> None:
@@ -502,14 +508,13 @@ def test_kokoro_warmup_synthesizes_once_per_resolved_configuration(monkeypatch) 
     pitch_routes._kokoro_warmed.clear()
 
 
-def test_health_identifies_an_explicit_kokoro_selection(monkeypatch) -> None:
+def test_health_does_not_expose_provider_configuration(monkeypatch) -> None:
     monkeypatch.setenv("TTS_PROVIDER", "kokoro")
 
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["speech_provider"] == "kokoro"
-    assert response.json()["kokoro_selected"] is True
+    assert response.json() == {"status": "ok"}
 
 
 def test_sarvam_failure_falls_back_to_openai(monkeypatch) -> None:

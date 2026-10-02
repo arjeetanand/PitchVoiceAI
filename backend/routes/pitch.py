@@ -6,25 +6,25 @@ import base64
 import binascii
 import os
 import re
-import shutil
 import sys
 import subprocess
-import tempfile
 import urllib.error
 import urllib.request
 import wave
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from threading import RLock
-from typing import Any
+from threading import BoundedSemaphore, Lock, RLock
+from time import monotonic
+from typing import Any, Iterator
 from xml.etree import ElementTree
 
-import pymupdf
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from config import setting as _setting
 
@@ -46,6 +46,14 @@ AUDIO_UPLOAD_EXTENSIONS = {
 AUDIO_UPLOAD_VIDEO_TYPES = {"video/mp4", "video/webm"}
 DEFAULT_MAX_AUDIO_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_DOCUMENT_BYTES = 25 * 1024 * 1024
+MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+MAX_JSON_REQUEST_BYTES = 640 * 1024
+MAX_DOCUMENT_SECTIONS = 1_000
+MAX_PPTX_SLIDES = 200
+MAX_OFFICE_ZIP_MEMBERS = 2_000
+MAX_OFFICE_MEMBER_BYTES = 2 * 1024 * 1024
+MAX_OFFICE_EXTRACTED_BYTES = 10 * 1024 * 1024
+MAX_TRANSCRIPTIONS_PER_HOUR = 30
 KOKORO_SAMPLE_RATE = 24_000
 KOKORO_MODEL_REPO = "hexgrad/Kokoro-82M"
 MAX_KOKORO_TEXT_CHARS = 1_200
@@ -56,15 +64,12 @@ DOCUMENT_EXTENSIONS = {
     ".markdown",
     ".md",
     ".pdf",
-    ".ppt",
     ".pptx",
     ".txt",
 }
 DOCUMENT_TYPES = {
-    "application/msword",
     "application/pdf",
     "application/rtf",
-    "application/vnd.ms-powerpoint",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/octet-stream",
@@ -79,6 +84,11 @@ XML_NS = {
 }
 _kokoro_lock = RLock()
 _kokoro_warmed: set[tuple[str, str, str, float, str]] = set()
+# ponytail: in-process hourly quota resets on restart and is per worker; use shared storage if scaled.
+_transcription_times: deque[float] = deque()
+_transcription_lock = Lock()
+_transcription_slots = BoundedSemaphore(2)
+UPLOAD_ENDPOINTS = {"/api/pitch/file", "/api/voice/transcribe"}
 router = APIRouter()
 
 
@@ -181,30 +191,55 @@ def _normalise_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def _sentence_parts(value: str) -> list[str]:
+def _sentence_parts(value: str) -> Iterator[str]:
     """Split prose without throwing away short table/list rows."""
 
     normalized = _normalise_text(value)
     if not normalized:
-        return []
-    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
-    return parts or [normalized]
+        return
+    start = 0
+    for match in re.finditer(r"(?<=[.!?])\s+", normalized):
+        part = normalized[start : match.start()].strip()
+        if part:
+            yield part
+        start = match.end()
+    part = normalized[start:].strip()
+    if part:
+        yield part
 
 
 def _text_sections(value: str, citation_prefix: str = "Source section") -> list[SourceSection]:
     sections: list[SourceSection] = []
+    max_chars = _document_character_limit()
+    if len(value) > max_chars:
+        raise ValueError(f"The document exceeds the {max_chars} character limit.")
+
+    def add_block(block: str) -> None:
+        for part in _sentence_parts(block):
+            if len(sections) >= MAX_DOCUMENT_SECTIONS:
+                raise ValueError(f"The document exceeds the {MAX_DOCUMENT_SECTIONS} section limit.")
+            sections.append(SourceSection(part, f"{citation_prefix} {len(sections) + 1}"))
+
     # Blank-line boundaries preserve headings and short list blocks. A single
     # line document still falls through to sentence-level sections.
-    blocks = [block.strip() for block in re.split(r"(?:\r?\n){2,}", value or "") if block.strip()]
-    if not blocks:
-        blocks = [value or ""]
-    for block in blocks:
-        for part in _sentence_parts(block):
-            sections.append(SourceSection(part, f"{citation_prefix} {len(sections) + 1}"))
+    start = 0
+    for match in re.finditer(r"(?:\r?\n){2,}", value or ""):
+        block = value[start : match.start()].strip()
+        if block:
+            add_block(block)
+        start = match.end()
+    block = (value or "")[start:].strip()
+    if block:
+        add_block(block)
     return sections
 
 
-def _xml_paragraphs(payload: bytes, namespace: str) -> list[str]:
+def _xml_paragraphs(
+    payload: bytes,
+    namespace: str,
+    max_chars: int,
+    max_paragraphs: int,
+) -> list[str]:
     """Extract paragraph text from OOXML while keeping table/list rows readable."""
 
     try:
@@ -213,28 +248,61 @@ def _xml_paragraphs(payload: bytes, namespace: str) -> list[str]:
         raise ValueError("The Office document contains invalid XML.") from exc
 
     paragraphs: list[str] = []
+    total_chars = 0
     paragraph_tag = f"{{{namespace}}}p"
     text_tag = f"{{{namespace}}}t"
     for paragraph in root.iter(paragraph_tag):
         text = "".join(node.text or "" for node in paragraph.iter(text_tag))
         text = _normalise_text(text)
         if text:
+            total_chars += len(text)
+            if total_chars > max_chars:
+                raise ValueError("The document exceeds the character limit.")
+            if len(paragraphs) >= max_paragraphs:
+                raise ValueError(f"The document exceeds the {MAX_DOCUMENT_SECTIONS} section limit.")
             paragraphs.append(text)
     return paragraphs
 
 
-def _zip_member(archive: zipfile.ZipFile, name: str) -> bytes:
-    try:
-        return archive.read(name)
-    except KeyError as exc:
-        raise ValueError(f"The Office document is missing {name}.") from exc
+def _zip_index(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+    members = archive.infolist()
+    if len(members) > MAX_OFFICE_ZIP_MEMBERS:
+        raise ValueError("The Office document contains too many archive members.")
+    index = {member.filename: member for member in members}
+    if len(index) != len(members):
+        raise ValueError("The Office document contains duplicate archive members.")
+    return index
+
+
+def _zip_member(
+    archive: zipfile.ZipFile,
+    index: dict[str, zipfile.ZipInfo],
+    name: str,
+    max_bytes: int = MAX_OFFICE_MEMBER_BYTES,
+) -> bytes:
+    member = index.get(name)
+    if member is None:
+        raise ValueError(f"The Office document is missing {name}.")
+    if member.file_size > max_bytes:
+        raise ValueError("An Office document XML member exceeds the expanded-size limit.")
+    with archive.open(member) as source:
+        payload = source.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("An Office document XML member exceeds the expanded-size limit.")
+    return payload
 
 
 def _extract_docx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            paragraphs = _xml_paragraphs(_zip_member(archive, "word/document.xml"), XML_NS["w"])
-            image_count = sum(1 for name in archive.namelist() if name.startswith("word/media/"))
+            index = _zip_index(archive)
+            paragraphs = _xml_paragraphs(
+                _zip_member(archive, index, "word/document.xml"),
+                XML_NS["w"],
+                _document_character_limit(),
+                MAX_DOCUMENT_SECTIONS,
+            )
+            image_count = sum(1 for name in index if name.startswith("word/media/"))
     except (zipfile.BadZipFile, ValueError) as exc:
         raise ValueError("This DOCX file could not be opened.") from exc
 
@@ -263,23 +331,54 @@ def _slide_number(name: str) -> int:
 def _extract_pptx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            index = _zip_index(archive)
             slide_names = sorted(
-                (name for name in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+                (name for name in index if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
                 key=_slide_number,
             )
             note_names = {
                 _slide_number(name): name
-                for name in archive.namelist()
+                for name in index
                 if re.fullmatch(r"ppt/notesSlides/notesSlide\d+\.xml", name)
             }
-            media_count = sum(1 for name in archive.namelist() if name.startswith("ppt/media/"))
+            if len(slide_names) > MAX_PPTX_SLIDES:
+                raise ValueError(f"The presentation exceeds the {MAX_PPTX_SLIDES} slide limit.")
+            media_count = sum(1 for name in index if name.startswith("ppt/media/"))
             sections: list[SourceSection] = []
             empty_slides: list[int] = []
+            extracted_bytes = 0
+            extracted_chars = 0
+            extracted_paragraphs = 0
             for name in slide_names:
                 slide_index = _slide_number(name)
-                paragraphs = _xml_paragraphs(_zip_member(archive, name), XML_NS["a"])
+                remaining_chars = _document_character_limit() - extracted_chars
+                remaining_paragraphs = MAX_DOCUMENT_SECTIONS - extracted_paragraphs
+                remaining_bytes = MAX_OFFICE_EXTRACTED_BYTES - extracted_bytes
+                slide_payload = _zip_member(
+                    archive, index, name, min(MAX_OFFICE_MEMBER_BYTES, remaining_bytes)
+                )
+                extracted_bytes += len(slide_payload)
+                paragraphs = _xml_paragraphs(
+                    slide_payload, XML_NS["a"], remaining_chars, remaining_paragraphs
+                )
+                extracted_chars += sum(map(len, paragraphs))
+                extracted_paragraphs += len(paragraphs)
                 notes_name = note_names.get(slide_index)
-                notes = _xml_paragraphs(_zip_member(archive, notes_name), XML_NS["a"]) if notes_name else []
+                if notes_name:
+                    remaining_chars = _document_character_limit() - extracted_chars
+                    remaining_paragraphs = MAX_DOCUMENT_SECTIONS - extracted_paragraphs
+                    remaining_bytes = MAX_OFFICE_EXTRACTED_BYTES - extracted_bytes
+                    notes_payload = _zip_member(
+                        archive, index, notes_name, min(MAX_OFFICE_MEMBER_BYTES, remaining_bytes)
+                    )
+                    extracted_bytes += len(notes_payload)
+                    notes = _xml_paragraphs(
+                        notes_payload, XML_NS["a"], remaining_chars, remaining_paragraphs
+                    )
+                    extracted_chars += sum(map(len, notes))
+                    extracted_paragraphs += len(notes)
+                else:
+                    notes = []
                 body = " ".join(paragraphs)
                 if notes:
                     body = f"{body} Speaker notes: {' '.join(notes)}".strip()
@@ -314,70 +413,36 @@ def _extract_pptx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     }
 
 
-def _extract_pdf(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
-    try:
-        with pymupdf.open(stream=payload, filetype="pdf") as document:
-            sections: list[SourceSection] = []
-            image_only_pages: list[int] = []
-            for page_number, page in enumerate(document, start=1):
-                text = _normalise_text(page.get_text("text"))
-                if text:
-                    sections.append(SourceSection(text, f"Page {page_number}", "page"))
-                else:
-                    image_only_pages.append(page_number)
-            page_count = len(document)
-    except (pymupdf.FileDataError, ValueError) as exc:
-        raise ValueError("This PDF could not be opened.") from exc
-
-    warnings: list[str] = []
-    if image_only_pages:
-        warnings.append(
-            "No selectable text was found on page(s) "
-            + ", ".join(str(index) for index in image_only_pages)
-            + "; scanned/image-only claims need review."
-        )
-    if not sections:
-        warnings.append("No selectable PDF text was found.")
-    return sections, {
-        "format": "pdf",
-        "pages": page_count,
-        "sections": len(sections),
-        "image_only_pages": image_only_pages,
-        "warnings": warnings,
-    }
-
-
-def _legacy_ppt_to_pptx(payload: bytes, filename: str) -> bytes:
-    """Convert legacy binary .ppt only when LibreOffice is available locally."""
-
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise ValueError("Legacy .ppt needs LibreOffice; export it as .pptx or PDF and try again.")
-    with tempfile.TemporaryDirectory(prefix="pitchroom-ppt-") as directory:
-        input_path = Path(directory) / (Path(filename or "pitch.ppt").stem + ".ppt")
-        input_path.write_bytes(payload)
-        try:
-            subprocess.run(
-                [soffice, "--headless", "--convert-to", "pptx", "--outdir", directory, str(input_path)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=45,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ValueError("Legacy .ppt conversion failed; export it as .pptx or PDF and try again.") from exc
-        converted = input_path.with_suffix(".pptx")
-        if not converted.exists():
-            raise ValueError("Legacy .ppt conversion produced no readable presentation.")
-        return converted.read_bytes()
-
-
 def _document_upload_limit() -> int:
     try:
         configured = int(_setting("MAX_DOCUMENT_BYTES", str(DEFAULT_MAX_DOCUMENT_BYTES)))
     except ValueError:
         return DEFAULT_MAX_DOCUMENT_BYTES
     return configured if configured > 0 else DEFAULT_MAX_DOCUMENT_BYTES
+
+
+def _document_character_limit() -> int:
+    try:
+        configured = int(_setting("MAX_DOCUMENT_CHARS", "50000"))
+    except ValueError:
+        return 50000
+    return configured if configured > 0 else 50000
+
+
+def request_body_limit(path: str) -> int:
+    if path == "/api/pitch/file":
+        return _document_upload_limit() + MAX_MULTIPART_OVERHEAD_BYTES
+    if path == "/api/voice/transcribe":
+        return _audio_upload_limit() + MAX_MULTIPART_OVERHEAD_BYTES
+    return MAX_JSON_REQUEST_BYTES
+
+
+def _transcription_hourly_limit() -> int:
+    try:
+        configured = int(_setting("MAX_TRANSCRIPTIONS_PER_HOUR", str(MAX_TRANSCRIPTIONS_PER_HOUR)))
+    except ValueError:
+        return MAX_TRANSCRIPTIONS_PER_HOUR
+    return max(1, configured)
 
 
 async def _read_limited_document_upload(file: UploadFile, max_bytes: int) -> bytes:
@@ -401,11 +466,36 @@ async def _read_limited_document_upload(file: UploadFile, max_bytes: int) -> byt
 def _extract_document(payload: bytes, filename: str, content_type: str) -> tuple[list[SourceSection], dict[str, Any]]:
     extension = Path(filename or "").suffix.lower()
     if extension == ".ppt":
-        payload = _legacy_ppt_to_pptx(payload, filename)
-        extension = ".pptx"
-        content_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        raise ValueError("Legacy .ppt uploads are disabled; export the presentation as .pptx or PDF.")
     if extension == ".pdf" or content_type == "application/pdf":
-        return _extract_pdf(payload)
+        worker = BACKEND_DIR / "pdf_parser.py"
+        worker_env = {
+            "PYTHONIOENCODING": "utf-8",
+            **{key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR") if key in os.environ},
+        }
+        try:
+            result = subprocess.run(
+                [sys.executable, str(worker), str(_document_upload_limit()), str(_document_character_limit())],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                cwd=BACKEND_DIR,
+                env=worker_env,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError("PDF extraction exceeded its time limit or could not start.") from exc
+        if result.returncode != 0:
+            raise ValueError("PDF extraction exceeded its process resource limits.")
+        try:
+            parsed = json.loads(result.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("PDF extraction returned an invalid result.") from exc
+        if "error" in parsed:
+            raise ValueError(parsed["error"])
+        sections = [SourceSection(**section) for section in parsed["sections"]]
+        return sections, parsed["metadata"]
     if extension == ".pptx" or content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
         return _extract_pptx(payload)
     if extension == ".docx" or content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -451,18 +541,27 @@ class DocumentStore:
         sections: list[SourceSection] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        prepared_sections = sections or _text_sections(text)
-        prepared_sections = [
-            SourceSection(_normalise_text(section.text), section.citation, section.kind)
-            for section in prepared_sections
-            if _normalise_text(section.text)
-        ]
-        normalized = _normalise_text(" ".join(section.text for section in prepared_sections))
-        max_chars = int(_setting("MAX_DOCUMENT_CHARS", "50000"))
+        max_chars = _document_character_limit()
+        source_sections = sections if sections else _text_sections(text)
+        prepared_sections: list[SourceSection] = []
+        normalized_parts: list[str] = []
+        total_chars = 0
+        for section in source_sections:
+            section_text = _normalise_text(section.text)
+            if not section_text:
+                continue
+            if normalized_parts:
+                total_chars += 1
+            total_chars += len(section_text)
+            if total_chars > max_chars:
+                raise ValueError(f"The document exceeds the {max_chars} character limit.")
+            if len(prepared_sections) >= MAX_DOCUMENT_SECTIONS:
+                raise ValueError(f"The document exceeds the {MAX_DOCUMENT_SECTIONS} section limit.")
+            prepared_sections.append(SourceSection(section_text, section.citation, section.kind))
+            normalized_parts.append(section_text)
+        normalized = " ".join(normalized_parts)
         if not normalized:
             raise ValueError("The document must contain text.")
-        if len(normalized) > max_chars:
-            raise ValueError(f"The document exceeds the {max_chars} character limit.")
         self.text = normalized
         self.sections = prepared_sections
         self.source = Path(source or "uploaded document").name or "uploaded document"
@@ -1078,17 +1177,10 @@ def _speech_provider() -> str:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
+    if not _setting("PITCHROOM_ACCESS_TOKEN", ""):
+        raise HTTPException(status_code=503, detail="Presenter authentication is not configured.")
     return {
         "status": "ok",
-        "document_loaded": bool(store.text),
-        "document_source": store.source,
-        "document_metadata": store.metadata,
-        "huggingface_configured": bool(_setting("HUGGINGFACE_API_TOKEN", "")),
-        "sarvam_configured": bool(_setting("SARVAM_API_KEY", "")),
-        "kokoro_selected": _tts_provider_preference() == "kokoro",
-        "piper_configured": bool(_setting("PIPER_TTS_URL", "")),
-        "openai_configured": bool(_setting("OPENAI_API_KEY", "")),
-        "speech_provider": _speech_provider(),
     }
 
 
@@ -1148,13 +1240,12 @@ async def upload_pitch_file(file: UploadFile = File(...)) -> dict[str, Any]:
     if extension not in DOCUMENT_EXTENSIONS and content_type not in DOCUMENT_TYPES:
         raise HTTPException(
             status_code=415,
-            detail="Upload a PPTX, PDF, DOCX, plain-text, or Markdown pitch file. Legacy .ppt files need LibreOffice.",
+            detail="Upload a PPTX, PDF, DOCX, plain-text, or Markdown pitch file. Export legacy .ppt files as .pptx or PDF.",
         )
     raw = await _read_limited_document_upload(file, _document_upload_limit())
     try:
-        sections, metadata = _extract_document(raw, filename, content_type)
-        text = "\n\n".join(section.text for section in sections)
-        store.replace(text, filename, sections=sections, metadata=metadata)
+        sections, metadata = await run_in_threadpool(_extract_document, raw, filename, content_type)
+        store.replace("", filename, sections=sections, metadata=metadata)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -1201,13 +1292,24 @@ async def transcribe_audio(file: UploadFile = File(...)) -> dict[str, str]:
             status_code=415,
             detail="Upload an audio recording (WAV, MP3, M4A, OGG, FLAC, AAC, or WebM).",
         )
-    audio = await _read_limited_audio_upload(file, _audio_upload_limit())
     if not _setting("HUGGINGFACE_API_TOKEN", ""):
         raise HTTPException(status_code=503, detail="Set HUGGINGFACE_API_TOKEN in .env to transcribe audio.")
+    audio = await _read_limited_audio_upload(file, _audio_upload_limit())
+    if not _transcription_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="The transcription service is busy. Try again shortly.")
     try:
-        text = _huggingface_transcription(audio, _audio_content_type(file))
+        now = monotonic()
+        with _transcription_lock:
+            while _transcription_times and now - _transcription_times[0] >= 3600:
+                _transcription_times.popleft()
+            if len(_transcription_times) >= _transcription_hourly_limit():
+                raise HTTPException(status_code=429, detail="The transcription hourly limit has been reached.")
+            _transcription_times.append(now)
+        text = await run_in_threadpool(_huggingface_transcription, audio, _audio_content_type(file))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        _transcription_slots.release()
     return {"text": text, "provider": "huggingface"}
 
 

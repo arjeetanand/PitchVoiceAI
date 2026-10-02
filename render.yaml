@@ -10,6 +10,8 @@ services:
     envVars:
       - key: FRONTEND_ORIGINS
         value: https://pitchvoice-ai.onrender.com
+      - key: PITCHROOM_ACCESS_TOKEN
+        sync: false
       - key: HUGGINGFACE_API_TOKEN
         sync: false
       - key: TTS_PROVIDER

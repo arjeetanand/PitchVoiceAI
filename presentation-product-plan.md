@@ -15,9 +15,8 @@ It now handles:
   typed fallback.
 
 It deliberately flags rather than invents answers for image-only slides,
-scanned pages, screenshots, and chart-only visuals. Legacy `.ppt` conversion is
-available only when LibreOffice is installed; `.pptx` is the reliable upload
-format.
+scanned pages, screenshots, and chart-only visuals. Legacy `.ppt` files must
+be exported as `.pptx` or PDF before upload.
 
 ## The product promise
 
@@ -144,7 +143,7 @@ can recover without a page reload.
 ### Later — platform
 
 - Streaming ASR/TTS after the recorded-turn path is measured and stable.
-- Multi-user auth, encrypted storage, retention controls, and audit logs.
+- Replace the shared room password with per-user and per-workspace access, encrypted storage, retention controls, and audit logs.
 - Evaluation dashboards showing citation accuracy and unsupported-answer rate.
 
 ## The pitch to judges

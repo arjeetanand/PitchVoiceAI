@@ -24,8 +24,11 @@ DEFAULTS: dict[str, str] = {
     "MAX_DOCUMENT_CHARS": "50000",
     "MAX_DOCUMENT_BYTES": str(25 * 1024 * 1024),
     "MAX_AUDIO_BYTES": str(10 * 1024 * 1024),
+    "MAX_TRANSCRIPTIONS_PER_HOUR": "30",
+    "PITCHROOM_ACCESS_TOKEN": "",
     "FRONTEND_ORIGINS": (
         "http://127.0.0.1:8501,http://localhost:8501,"
+        "http://127.0.0.1:8000,http://localhost:8000,"
         "http://localhost:3000,http://localhost:5173"
     ),
     "ANSWER_GENERATION_PROVIDER": "extractive",
