@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import subprocess
+import struct
 import urllib.error
 import urllib.request
 import wave
@@ -51,6 +52,9 @@ MAX_JSON_REQUEST_BYTES = 640 * 1024
 MAX_DOCUMENT_SECTIONS = 1_000
 MAX_PPTX_SLIDES = 200
 MAX_OFFICE_ZIP_MEMBERS = 2_000
+MAX_OFFICE_CENTRAL_DIRECTORY_BYTES = 2 * 1024 * 1024
+MAX_OFFICE_XML_NODES = 100_000
+MAX_OFFICE_XML_DEPTH = 128
 MAX_OFFICE_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_OFFICE_EXTRACTED_BYTES = 10 * 1024 * 1024
 MAX_TRANSCRIPTIONS_PER_HOUR = 30
@@ -242,26 +246,91 @@ def _xml_paragraphs(
 ) -> list[str]:
     """Extract paragraph text from OOXML while keeping table/list rows readable."""
 
-    try:
-        root = ElementTree.fromstring(payload)
-    except ElementTree.ParseError as exc:
-        raise ValueError("The Office document contains invalid XML.") from exc
-
     paragraphs: list[str] = []
     total_chars = 0
     paragraph_tag = f"{{{namespace}}}p"
     text_tag = f"{{{namespace}}}t"
-    for paragraph in root.iter(paragraph_tag):
-        text = "".join(node.text or "" for node in paragraph.iter(text_tag))
-        text = _normalise_text(text)
-        if text:
-            total_chars += len(text)
-            if total_chars > max_chars:
-                raise ValueError("The document exceeds the character limit.")
-            if len(paragraphs) >= max_paragraphs:
-                raise ValueError(f"The document exceeds the {MAX_DOCUMENT_SECTIONS} section limit.")
-            paragraphs.append(text)
+    paragraph_depth = 0
+    paragraph_text: list[str] = []
+    xml_depth = 0
+    xml_nodes = 0
+    try:
+        # Visit each XML node once. Re-walking each paragraph's descendants can
+        # become quadratic for hostile nested paragraph elements.
+        for event, node in ElementTree.iterparse(io.BytesIO(payload), events=("start", "end")):
+            if event == "start":
+                xml_depth += 1
+                xml_nodes += 1
+                if xml_depth > MAX_OFFICE_XML_DEPTH:
+                    raise ValueError("The Office document XML is nested too deeply.")
+                if xml_nodes > MAX_OFFICE_XML_NODES:
+                    raise ValueError("The Office document XML contains too many elements.")
+                if node.tag == paragraph_tag:
+                    if paragraph_depth == 0:
+                        paragraph_text = []
+                    paragraph_depth += 1
+                continue
+
+            if paragraph_depth and node.tag == text_tag and node.text:
+                paragraph_text.append(node.text)
+            if node.tag == paragraph_tag and paragraph_depth:
+                paragraph_depth -= 1
+                if paragraph_depth == 0:
+                    text = _normalise_text("".join(paragraph_text))
+                    if text:
+                        total_chars += len(text)
+                        if total_chars > max_chars:
+                            raise ValueError("The document exceeds the character limit.")
+                        if len(paragraphs) >= max_paragraphs:
+                            raise ValueError(
+                                f"The document exceeds the {MAX_DOCUMENT_SECTIONS} section limit."
+                            )
+                        paragraphs.append(text)
+            node.clear()
+            xml_depth -= 1
+    except ElementTree.ParseError as exc:
+        raise ValueError("The Office document contains invalid XML.") from exc
     return paragraphs
+
+
+def _preflight_office_zip(payload: bytes) -> None:
+    """Bound ZIP metadata before ZipFile builds an in-memory member index."""
+    eocd_signature = b"PK\x05\x06"
+    search_start = max(0, len(payload) - (22 + 0xFFFF))
+    eocd_offset = payload.rfind(eocd_signature, search_start)
+    while eocd_offset >= 0:
+        if eocd_offset + 22 <= len(payload):
+            fields = struct.unpack_from("<4s4H2LH", payload, eocd_offset)
+            if eocd_offset + 22 + fields[-1] == len(payload):
+                break
+        eocd_offset = payload.rfind(eocd_signature, search_start, eocd_offset)
+    if eocd_offset < 0:
+        raise ValueError("The Office document has an invalid ZIP directory.")
+
+    (
+        signature,
+        disk_number,
+        directory_disk,
+        disk_members,
+        total_members,
+        directory_size,
+        directory_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", payload, eocd_offset)
+    if signature != eocd_signature:
+        raise ValueError("The Office document has an invalid ZIP directory.")
+    if disk_number or directory_disk or disk_members != total_members:
+        raise ValueError("Multi-disk Office archives are not supported.")
+    # Office files handled here are small uploads; reject ZIP64 sentinel values
+    # and bound the central directory before zipfile parses its entries.
+    if total_members == 0xFFFF or directory_size == 0xFFFFFFFF or directory_offset == 0xFFFFFFFF:
+        raise ValueError("ZIP64 Office archives are not supported.")
+    if total_members > MAX_OFFICE_ZIP_MEMBERS:
+        raise ValueError("The Office document contains too many archive members.")
+    if directory_size > MAX_OFFICE_CENTRAL_DIRECTORY_BYTES:
+        raise ValueError("The Office document contains an oversized ZIP directory.")
+    if directory_offset + directory_size > eocd_offset:
+        raise ValueError("The Office document has an invalid ZIP directory.")
 
 
 def _zip_index(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
@@ -294,6 +363,7 @@ def _zip_member(
 
 def _extract_docx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     try:
+        _preflight_office_zip(payload)
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             index = _zip_index(archive)
             paragraphs = _xml_paragraphs(
@@ -330,6 +400,7 @@ def _slide_number(name: str) -> int:
 
 def _extract_pptx(payload: bytes) -> tuple[list[SourceSection], dict[str, Any]]:
     try:
+        _preflight_office_zip(payload)
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             index = _zip_index(archive)
             slide_names = sorted(
