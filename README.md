@@ -78,6 +78,12 @@ Live microphone transcription also needs a Hugging Face token in `.env`:
 HUGGINGFACE_API_TOKEN=your_token_here
 ```
 
+The hosted demo also requires a private `PITCHROOM_ACCESS_TOKEN` secret. Generate
+one with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`, then
+add it to Render's environment settings. The room asks attendees for this token
+the first time they use the app in a tab. Set the same value in `.env` to enable
+the access gate locally. The public `/health` check returns status only.
+
 The important provider choices are:
 
 - `TTS_PROVIDER=kokoro` is the recommended hackathon studio voice: a local, cached Kokoro English model with the curated `af_heart` narrator. Install it with `.venv/bin/python -m pip install -r backend/requirements-kokoro.txt`; its first model download is about 360 MB, then answer text stays on the presentation machine with no per-request TTS charge.
@@ -142,6 +148,7 @@ The format support, trust boundary, and production path are in
 .venv/bin/python -m pytest backend -q
 node --check frontend/static/app.js
 node --check frontend/static/scene.js
+node --test frontend/test_e2e.mjs # local Chrome required
 ```
 
 ## Deployment

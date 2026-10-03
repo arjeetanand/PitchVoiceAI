@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:opsz,wght@6..96,400..700&family=DM+Mono:wght@400;500&family=Jost:wght@400;500;600;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=luxury-type-v2" />
+    <link rel="stylesheet" href="/static/styles.css?v=voice-console-v3" />
   </head>
   <body>
     <a class="skip-link" href="#live-stage">Skip to live rehearsal</a>
@@ -59,7 +59,20 @@
           </div>
           <p class="grounding-line"><span class="source-dot" aria-hidden="true"></span>Grounded in your approved source</p>
         </div>
-        <div class="hero-spacer" aria-hidden="true"></div>
+        <aside class="hero-console" aria-label="Voice agent preview">
+          <div class="hero-console-head"><span>Pitchroom / live room</span><span class="hero-console-ready"><i aria-hidden="true"></i><span id="hero-source-status">Connecting source</span></span></div>
+          <div class="hero-console-presence" aria-hidden="true">
+            <span class="hero-console-ring hero-console-ring-outer"></span>
+            <span class="hero-console-ring hero-console-ring-inner"></span>
+            <span class="hero-console-orbit hero-console-orbit-left">HEAR</span>
+            <span class="hero-console-orbit hero-console-orbit-right">ANSWER</span>
+            <span class="hero-console-core"><span class="hero-console-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></span>
+          </div>
+          <div class="hero-console-foot">
+            <div class="hero-console-status"><span>01 / ASK THE DECK</span><strong id="hero-agent-state">Ready when you are</strong><p>Get evidence from your source, or a clear refusal.</p></div>
+            <button class="hero-console-question" type="button" aria-label="Ask the approved source: What problem does this pitch solve?" data-question="What problem does this pitch solve?" data-ask-now><span>Try a question without a microphone</span><strong>What problem does this pitch solve?</strong><span class="hero-console-question-arrow" aria-hidden="true">↗</span></button>
+          </div>
+        </aside>
         <p class="story-signature"><span aria-hidden="true"></span>Real conversations. Stronger pitches.</p>
       </section>
 
@@ -95,6 +108,7 @@
               </ol>
               <div id="state-chip" class="state-chip" aria-live="polite"><span class="state-dot" aria-hidden="true"></span><span id="state-label">Ready when you are</span></div>
             </div>
+            <p class="agent-trace"><span class="agent-trace-dot" aria-hidden="true"></span><span>Agent activity</span><strong id="agent-trace-status">Waiting for your question</strong></p>
 
             <div class="voice-field" aria-hidden="true">
               <div class="voice-halo-line voice-halo-line-a"></div>
@@ -135,6 +149,7 @@
                 <button id="play-answer" class="text-button" type="button" hidden><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 8 6-8 6z" fill="currentColor" /><path d="M5.5 9.5v5" stroke="currentColor" stroke-linecap="round" stroke-width="1.8" /></svg>Play answer</button>
               </section>
             </div>
+            <div id="source-peek" class="source-peek" hidden><span class="source-peek-label">Evidence used</span><strong id="source-peek-citation"></strong><p id="source-peek-text"></p><a href="#evidence-section">View source trail <span aria-hidden="true">↗</span></a></div>
             <form id="text-question-form" class="text-question-form">
               <label for="text-question">No microphone? Ask from the same source.</label>
               <div class="question-input-row"><input id="text-question" name="question" type="text" maxlength="2000" placeholder="What problem does Pitchroom AI solve?" autocomplete="off" /><button class="button button-secondary" type="submit">Ask</button></div>
@@ -174,6 +189,7 @@
 
     <footer class="footer"><span>Pitchroom AI</span><span>Source-grounded rehearsal for the live room.</span></footer>
     <script src="/static/scene.js?v=depth-field-v5" defer></script>
-    <script src="/static/app.js?v=source-citations-v1" defer></script>
+    <script type="module" src="/static/motion.js?v=motion-v2"></script>
+    <script src="/static/app.js?v=agent-flow-v3" defer></script>
   </body>
 </html>
