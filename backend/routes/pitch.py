@@ -26,6 +26,8 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from defusedxml import ElementTree as DefusedElementTree
+from defusedxml.common import DefusedXmlException
 
 from config import setting as _setting
 
@@ -257,7 +259,13 @@ def _xml_paragraphs(
     try:
         # Visit each XML node once. Re-walking each paragraph's descendants can
         # become quadratic for hostile nested paragraph elements.
-        for event, node in ElementTree.iterparse(io.BytesIO(payload), events=("start", "end")):
+        for event, node in DefusedElementTree.iterparse(
+            io.BytesIO(payload),
+            events=("start", "end"),
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        ):
             if event == "start":
                 xml_depth += 1
                 xml_nodes += 1
@@ -288,8 +296,8 @@ def _xml_paragraphs(
                         paragraphs.append(text)
             node.clear()
             xml_depth -= 1
-    except ElementTree.ParseError as exc:
-        raise ValueError("The Office document contains invalid XML.") from exc
+    except (ElementTree.ParseError, DefusedXmlException) as exc:
+        raise ValueError("The Office document contains invalid or prohibited XML.") from exc
     return paragraphs
 
 

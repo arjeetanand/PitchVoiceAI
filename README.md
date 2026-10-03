@@ -38,8 +38,8 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
 Copy the generated value into `.env` as `PITCHROOM_ACCESS_TOKEN`, then run
-`./run-dev.sh`. The browser prompts for username `presenter` and that password.
-The room uses one shared password; it does not provide per-user accounts or
+`./run-dev.sh`. The room asks for this token on the first protected API request.
+All presenters share one token; the room does not provide per-user accounts or
 workspace isolation.
 
 The Kokoro requirements are the recommended presentation install. They include
@@ -155,11 +155,11 @@ node --test frontend/test_e2e.mjs # local Chrome required
 
 `render.yaml` exposes one FastAPI service that serves both the static live room
 and `/api` from the same origin. Set `PITCHROOM_ACCESS_TOKEN` and
-`HUGGINGFACE_API_TOKEN` in the Render dashboard before opening the room. Render
+`HUGGINGFACE_API_TOKEN` in the Render dashboard before using the live room. Render
 uses the free browser voice by default; Hugging Face is needed for live speech
 transcription. Run Kokoro locally for the polished in-person presentation
 voice, or configure another server provider only when you intentionally need
-it. HTTPS is required for microphone capture and protects the shared password
-in transit.
+it. HTTPS is required for microphone capture and protects the shared token in
+transit.
 
 Before presenting from a deployed service, use a non-sensitive source document, run the microphone check in the target browser, make one automatic-pause voice turn, and verify that a spoken interruption starts a fresh turn.

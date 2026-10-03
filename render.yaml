@@ -14,8 +14,6 @@ services:
         sync: false
       - key: HUGGINGFACE_API_TOKEN
         sync: false
-      - key: PITCHROOM_ACCESS_TOKEN
-        sync: false
       - key: TTS_PROVIDER
         value: browser
       - key: PITCH_DOCUMENT_PATH

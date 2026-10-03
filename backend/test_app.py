@@ -18,13 +18,10 @@ import app
 from routes import pitch as pitch_routes
 
 
-authorization = base64.b64encode(
-    f"presenter:{os.environ['PITCHROOM_ACCESS_TOKEN']}".encode("utf-8")
-).decode("ascii")
 client = TestClient(
     app.app,
     headers={
-        "Authorization": f"Basic {authorization}",
+        "Authorization": f"Bearer {os.environ['PITCHROOM_ACCESS_TOKEN']}",
         "Origin": "http://127.0.0.1:8501",
     },
 )
@@ -39,11 +36,58 @@ def setup_function() -> None:
 
 
 def test_root_serves_the_live_pitchroom_interface() -> None:
-    response = client.get("/")
+    anonymous = TestClient(app.app)
+    response = anonymous.get("/")
 
     assert response.status_code == 200
     assert "Pitchroom AI" in response.text
     assert "/static/app.js" in response.text
+    script = anonymous.get("/static/app.js")
+    assert script.status_code == 200
+    assert 'headers.set("Authorization", `Bearer ${token}`)' in script.text
+
+
+def test_bearer_token_authorizes_api_after_public_room_bootstrap() -> None:
+    app.store.replace("The presenter-only rehearsal source.", "private.txt")
+    anonymous = TestClient(app.app)
+
+    assert anonymous.get("/api/pitch").status_code == 401
+    response = client.get("/api/pitch")
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "The presenter-only rehearsal source."
+
+
+def test_api_preflight_does_not_require_a_bearer_token() -> None:
+    anonymous = TestClient(app.app)
+    response = anonymous.options(
+        "/api/pitch/document",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_api_write_rejects_an_untrusted_origin() -> None:
+    untrusted_client = TestClient(
+        app.app,
+        headers={
+            "Authorization": f"Bearer {os.environ['PITCHROOM_ACCESS_TOKEN']}",
+            "Origin": "https://untrusted.example",
+        },
+    )
+
+    response = untrusted_client.post(
+        "/api/pitch/document",
+        json={"document": "attacker source"},
+    )
+
+    assert response.status_code == 403
 
 
 def test_unauthenticated_clients_cannot_read_or_replace_the_shared_pitch() -> None:
@@ -755,9 +799,9 @@ def test_docx_expansion_limit_rejects_before_xml_parsing(monkeypatch) -> None:
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", xml)
     monkeypatch.setattr(
-        pitch_routes.ElementTree,
-        "fromstring",
-        lambda value: (_ for _ in ()).throw(AssertionError("expanded XML was parsed")),
+        pitch_routes.DefusedElementTree,
+        "iterparse",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("expanded XML was parsed")),
     )
 
     response = client.post(
@@ -772,6 +816,49 @@ def test_docx_expansion_limit_rejects_before_xml_parsing(monkeypatch) -> None:
     )
 
     assert response.status_code == 400
+
+
+def test_docx_internal_entities_are_rejected_before_expansion() -> None:
+    xml = (
+        b'<!DOCTYPE w:document [<!ENTITY pitch "expanded private pitch text">]>'
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b"<w:body><w:p><w:r><w:t>&pitch;</w:t></w:r></w:p></w:body></w:document>"
+    )
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", xml)
+
+    response = client.post(
+        "/api/pitch/file",
+        files={
+            "file": (
+                "pitch.docx",
+                payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_pptx_internal_entities_are_rejected_before_expansion() -> None:
+    xml = (
+        b'<!DOCTYPE p:sld [<!ENTITY pitch "expanded private pitch text">]>'
+        b'<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        b'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        b"<p:cSld><a:p><a:r><a:t>&pitch;</a:t></a:r></a:p></p:cSld></p:sld>"
+    )
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("ppt/slides/slide1.xml", xml)
+
+    try:
+        pitch_routes._extract_pptx(payload.getvalue())
+    except ValueError as exc:
+        assert str(exc) == "This PPTX file could not be opened."
+    else:
+        raise AssertionError("PPTX internal entities should be rejected before expansion.")
 
 
 def test_huggingface_text_accepts_object_response(monkeypatch) -> None:

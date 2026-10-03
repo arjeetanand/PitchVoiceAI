@@ -11,9 +11,9 @@ python -m uvicorn app:app --reload
 ```
 
 Before starting, create the repository-root `.env` from [`.env.example`](../.env.example)
-and set a long random `PITCHROOM_ACCESS_TOKEN`; the service fails closed while
-it is empty. The browser uses HTTP Basic authentication with username
-`presenter` and that shared token.
+and set a long random `PITCHROOM_ACCESS_TOKEN`; API requests fail closed until
+it is set. The browser asks for that shared token on the first protected API
+request; the room page and static assets remain available so the prompt can load.
 
 For local MMS TTS, the requirements install a CPU-only PyTorch build on Linux and a compatible PyPI wheel on macOS/other local platforms:
 
@@ -26,7 +26,7 @@ The API runs at `http://localhost:8000` when launched directly. The repository's
 ## Routes
 
 - `GET /health` is an anonymous status-only service check; it reports 503 until presenter authentication is configured.
-- `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata. All room and API routes require HTTP Basic authentication with username `presenter` and the `PITCHROOM_ACCESS_TOKEN` value.
+- `GET /api/pitch` returns the loaded pitch, source sections, citations, and extraction metadata. API routes require `Authorization: Bearer <PITCHROOM_ACCESS_TOKEN>`; the public room UI asks for the token before making protected API requests.
 - `POST /api/pitch/demo` restores the included Pitchroom demo brief.
 - `POST /api/pitch/document` accepts `{ "document": "..." }`.
 - `POST /api/pitch/file` accepts PPTX, selectable-text PDF on Linux, DOCX, plain-text, or Markdown uploads. PPTX text and speaker notes are extracted slide by slide; PDF text is extracted in a time-bounded worker with Linux CPU/memory limits; DOCX paragraphs are extracted from OOXML. PDF uploads are rejected on other platforms rather than parsed without a memory cap. Export legacy `.ppt` files as `.pptx` or PDF first.
@@ -76,8 +76,8 @@ Set `TTS_PROVIDER=auto` with `SARVAM_API_KEY` to use Sarvam Bulbul for speech ou
 The repository-root `.env` is loaded automatically when the backend starts.
 Use the categorized root [`.env.example`](../.env.example) as the only setup
 reference. Set a long random `PITCHROOM_ACCESS_TOKEN` before starting the
-service; an empty value fails closed. The browser asks for username `presenter`
-and that shared password. Also set `HUGGINGFACE_API_TOKEN` before using
+service; an empty value fails closed on API requests. The browser asks for that
+shared token. Also set `HUGGINGFACE_API_TOKEN` before using
 microphone transcription. Unsafe requests must come from an origin listed in
 `FRONTEND_ORIGINS`; the shipped live room uses the same origin. Request bodies,
 uploads, Office archive extraction, PDF pages, and document sections have

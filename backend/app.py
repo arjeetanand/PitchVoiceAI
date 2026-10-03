@@ -1,5 +1,3 @@
-import base64
-import binascii
 import hmac
 import json
 from pathlib import Path
@@ -18,7 +16,7 @@ from routes.pitch import UPLOAD_ENDPOINTS, request_body_limit, router, store
 
 
 class RequestSecurityMiddleware:
-    """Authenticate the room and bound request parsing before FastAPI reads bodies."""
+    """Protect API calls and bound request parsing before FastAPI reads bodies."""
 
     def __init__(self, app):
         self.app = app
@@ -52,8 +50,8 @@ class RequestSecurityMiddleware:
                 await self._respond(send, 413, "The request body exceeds the size limit.")
                 return
 
-        health_check = path == "/health" and method == "GET"
-        if not health_check:
+        api_request = path == "/api" or path.startswith("/api/")
+        if api_request and method != "OPTIONS":
             access_token = setting("PITCHROOM_ACCESS_TOKEN")
             if not access_token:
                 await self._respond(send, 503, "PITCHROOM_ACCESS_TOKEN must be configured.")
@@ -63,8 +61,8 @@ class RequestSecurityMiddleware:
                 await self._respond(
                     send,
                     401,
-                    "Authentication is required.",
-                    [(b"www-authenticate", b'Basic realm="Pitchroom AI", charset="UTF-8"')],
+                    "Enter the access token configured for this Pitchroom room.",
+                    [(b"www-authenticate", b"Bearer")],
                 )
                 return
 
@@ -104,14 +102,12 @@ class RequestSecurityMiddleware:
     @staticmethod
     def _authorized(header: bytes, access_token: str) -> bool:
         try:
-            scheme, encoded = header.decode("ascii").split(" ", 1)
-            if scheme.lower() != "basic" or len(encoded) > 4096:
+            scheme, provided_token = header.decode("ascii").split(" ", 1)
+            if scheme.lower() != "bearer" or len(provided_token) > 4096:
                 return False
-            credentials = base64.b64decode(encoded, validate=True)
-        except (UnicodeDecodeError, ValueError, binascii.Error):
+        except (UnicodeDecodeError, ValueError):
             return False
-        expected = f"presenter:{access_token}".encode("utf-8")
-        return hmac.compare_digest(credentials, expected)
+        return hmac.compare_digest(provided_token.encode("ascii"), access_token.encode("utf-8"))
 
     @staticmethod
     async def _respond(send, status: int, detail: str, extra_headers=None) -> None:
